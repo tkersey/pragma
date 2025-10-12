@@ -1,6 +1,6 @@
 # pragma
 
-`pragma` is a lightweight Zig CLI that wraps `codex exec` so coding agents can run sub-agents without relying on the full OpenCode stack. The tool accepts a single positional argument — the system prompt that should govern the sub-agent — and handles the rest:
+`pragma` is a lightweight Zig CLI that wraps `codex exec` so coding agents can run sub-agents without a larger toolchain. The tool accepts a single positional argument — the system prompt that should govern the sub-agent — and handles the rest:
 
 - Frames the call with a minimal sub-agent persona and reminds the model to ask for extra context when needed.
 - Invokes `codex exec --skip-git-repo-check --json -c 'mcp_servers={}'` (make sure `codex` is on your `$PATH`).
