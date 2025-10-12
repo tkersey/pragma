@@ -86,11 +86,11 @@ fn assemblePrompt(allocator: Allocator, system_prompt: []const u8) ![]u8 {
 fn runCodex(allocator: Allocator, prompt: []const u8) ![]u8 {
     const argv = [_][]const u8{
         "codex",
+        "--search",
+        "--yolo",
         "exec",
         "--skip-git-repo-check",
         "--json",
-        "--search",
-        "--yolo",
         "-c",
         "mcp_servers={}",
         prompt,
