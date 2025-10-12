@@ -89,6 +89,8 @@ fn runCodex(allocator: Allocator, prompt: []const u8) ![]u8 {
         "exec",
         "--skip-git-repo-check",
         "--json",
+        "--search",
+        "--yolo",
         "-c",
         "mcp_servers={}",
         prompt,
