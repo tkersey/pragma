@@ -121,8 +121,8 @@ fn collectChildOutput(
     var stderr_list: ArrayList(u8) = .empty;
     defer stderr_list.deinit(allocator);
 
-    const stdout_file = child.stdout orelse unreachable;
-    const stderr_file = child.stderr orelse unreachable;
+    const stdout_file = child.stdout orelse return error.StdoutNotPiped;
+    const stderr_file = child.stderr orelse return error.StderrNotPiped;
 
     var poller = std.Io.poll(allocator, PollStreams, .{
         .stdout = stdout_file,
