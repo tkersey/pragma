@@ -100,6 +100,10 @@ fn assemblePrompt(allocator: Allocator, system_prompt: []const u8) ![]u8 {
     );
 }
 
+fn parseBufferLimit(value_str: []const u8, default: usize) usize {
+    return std.fmt.parseInt(usize, value_str, 10) catch default;
+}
+
 fn runCodex(allocator: Allocator, prompt: []const u8) ![]u8 {
     const argv = [_][]const u8{
         "codex",
@@ -119,13 +123,29 @@ fn runCodex(allocator: Allocator, prompt: []const u8) ![]u8 {
     process.stderr_behavior = .Pipe;
 
     try process.spawn();
+    errdefer _ = process.wait() catch {};
 
-    const stdout_bytes = try process.stdout.?.readToEndAlloc(allocator, 10 * 1024 * 1024);
+    const max_stdout = blk: {
+        const env = std.process.getEnvVarOwned(allocator, "PRAGMA_MAX_STDOUT") catch break :blk 100 * 1024 * 1024;
+        defer allocator.free(env);
+        break :blk parseBufferLimit(env, 100 * 1024 * 1024);
+    };
+    const max_stderr = blk: {
+        const env = std.process.getEnvVarOwned(allocator, "PRAGMA_MAX_STDERR") catch break :blk 10 * 1024 * 1024;
+        defer allocator.free(env);
+        break :blk parseBufferLimit(env, 10 * 1024 * 1024);
+    };
+
+    const stdout_bytes = try process.stdout.?.readToEndAlloc(allocator, max_stdout);
     defer allocator.free(stdout_bytes);
-    const stderr_bytes = try process.stderr.?.readToEndAlloc(allocator, 1024 * 1024);
+    const stderr_bytes = try process.stderr.?.readToEndAlloc(allocator, max_stderr);
     defer allocator.free(stderr_bytes);
 
-    _ = process.wait() catch {};
+    const term = try process.wait();
+    switch (term) {
+        .Exited => |code| if (code != 0) return error.CodexFailed,
+        else => return error.CodexFailed,
+    }
 
     if (stderr_bytes.len > 0) {
         _ = try std.fs.File.stderr().writeAll(stderr_bytes);
@@ -192,4 +212,137 @@ fn extractAgentMarkdown(allocator: Allocator, stream: []const u8) ![]u8 {
 
     const fallback = std.mem.trim(u8, stream, " \r\n");
     return allocator.dupe(u8, fallback);
+}
+
+// Tests
+
+test "extractAgentMarkdown: valid JSON with agent_message" {
+    const allocator = std.testing.allocator;
+    const json_stream =
+        \\{"type":"item.completed","item":{"type":"agent_message","text":"Hello World"}}
+    ;
+
+    const result = try extractAgentMarkdown(allocator, json_stream);
+    defer allocator.free(result);
+
+    try std.testing.expectEqualStrings("Hello World", result);
+}
+
+test "extractAgentMarkdown: multiple messages returns last" {
+    const allocator = std.testing.allocator;
+    const json_stream =
+        \\{"type":"item.completed","item":{"type":"agent_message","text":"First"}}
+        \\{"type":"item.completed","item":{"type":"agent_message","text":"Second"}}
+        \\{"type":"item.completed","item":{"type":"agent_message","text":"Third"}}
+    ;
+
+    const result = try extractAgentMarkdown(allocator, json_stream);
+    defer allocator.free(result);
+
+    try std.testing.expectEqualStrings("Third", result);
+}
+
+test "extractAgentMarkdown: empty stream returns empty" {
+    const allocator = std.testing.allocator;
+    const json_stream = "";
+
+    const result = try extractAgentMarkdown(allocator, json_stream);
+    defer allocator.free(result);
+
+    try std.testing.expectEqualStrings("", result);
+}
+
+test "extractAgentMarkdown: whitespace only returns empty" {
+    const allocator = std.testing.allocator;
+    const json_stream = "   \n\n  \r\n   ";
+
+    const result = try extractAgentMarkdown(allocator, json_stream);
+    defer allocator.free(result);
+
+    try std.testing.expectEqualStrings("", result);
+}
+
+test "extractAgentMarkdown: malformed JSON skipped, uses fallback" {
+    const allocator = std.testing.allocator;
+    const json_stream = "not valid json\nmore invalid\nplain text output";
+
+    const result = try extractAgentMarkdown(allocator, json_stream);
+    defer allocator.free(result);
+
+    try std.testing.expectEqualStrings("not valid json\nmore invalid\nplain text output", result);
+}
+
+test "extractAgentMarkdown: wrong event type uses fallback" {
+    const allocator = std.testing.allocator;
+    const json_stream =
+        \\{"type":"other.event","item":{"type":"agent_message","text":"Should ignore"}}
+        \\fallback text
+    ;
+
+    const result = try extractAgentMarkdown(allocator, json_stream);
+    defer allocator.free(result);
+
+    try std.testing.expectEqualStrings("{\"type\":\"other.event\",\"item\":{\"type\":\"agent_message\",\"text\":\"Should ignore\"}}\nfallback text", result);
+}
+
+test "extractAgentMarkdown: wrong item type uses fallback" {
+    const allocator = std.testing.allocator;
+    const json_stream =
+        \\{"type":"item.completed","item":{"type":"other_type","text":"Should ignore"}}
+        \\fallback
+    ;
+
+    const result = try extractAgentMarkdown(allocator, json_stream);
+    defer allocator.free(result);
+
+    try std.testing.expectEqualStrings("{\"type\":\"item.completed\",\"item\":{\"type\":\"other_type\",\"text\":\"Should ignore\"}}\nfallback", result);
+}
+
+test "extractAgentMarkdown: mixed valid and invalid JSON" {
+    const allocator = std.testing.allocator;
+    const json_stream =
+        \\invalid line
+        \\{"type":"item.completed","item":{"type":"agent_message","text":"Valid"}}
+        \\more invalid
+    ;
+
+    const result = try extractAgentMarkdown(allocator, json_stream);
+    defer allocator.free(result);
+
+    try std.testing.expectEqualStrings("Valid", result);
+}
+
+test "parseBufferLimit: valid positive number" {
+    const result = parseBufferLimit("1024", 512);
+    try std.testing.expectEqual(@as(usize, 1024), result);
+}
+
+test "parseBufferLimit: large number" {
+    const result = parseBufferLimit("104857600", 1024);
+    try std.testing.expectEqual(@as(usize, 104857600), result);
+}
+
+test "parseBufferLimit: zero is valid" {
+    const result = parseBufferLimit("0", 1024);
+    try std.testing.expectEqual(@as(usize, 0), result);
+}
+
+test "parseBufferLimit: invalid string returns default" {
+    const result = parseBufferLimit("not-a-number", 512);
+    try std.testing.expectEqual(@as(usize, 512), result);
+}
+
+test "parseBufferLimit: empty string returns default" {
+    const result = parseBufferLimit("", 1024);
+    try std.testing.expectEqual(@as(usize, 1024), result);
+}
+
+test "parseBufferLimit: negative number returns default" {
+    const result = parseBufferLimit("-100", 1024);
+    try std.testing.expectEqual(@as(usize, 1024), result);
+}
+
+test "parseBufferLimit: mixed alphanumeric returns default" {
+    const result = parseBufferLimit("123abc", 2048);
+    try std.testing.expectEqual(@as(usize, 2048), result);
 }
