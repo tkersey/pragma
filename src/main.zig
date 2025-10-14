@@ -2,6 +2,7 @@ const std = @import("std");
 
 const Allocator = std.mem.Allocator;
 const ManagedArrayList = std.array_list.Managed;
+const ArrayList = std.ArrayList;
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
@@ -96,12 +97,75 @@ fn assemblePrompt(allocator: Allocator, system_prompt: []const u8) ![]u8 {
             "\n" ++
             "### Directive Uplink\n" ++
             "<directive>\n{s}\n</directive>",
-        .{ system_prompt },
+        .{system_prompt},
     );
 }
 
 fn parseBufferLimit(value_str: []const u8, default: usize) usize {
     return std.fmt.parseInt(usize, value_str, 10) catch default;
+}
+
+fn collectChildOutput(
+    allocator: Allocator,
+    child: *std.process.Child,
+    max_stdout: usize,
+    max_stderr: usize,
+) !struct {
+    stdout: []u8,
+    stderr: []u8,
+} {
+    const PollStreams = enum { stdout, stderr };
+
+    var stdout_list: ArrayList(u8) = .empty;
+    defer stdout_list.deinit(allocator);
+    var stderr_list: ArrayList(u8) = .empty;
+    defer stderr_list.deinit(allocator);
+
+    const stdout_file = child.stdout orelse unreachable;
+    const stderr_file = child.stderr orelse unreachable;
+
+    var poller = std.Io.poll(allocator, PollStreams, .{
+        .stdout = stdout_file,
+        .stderr = stderr_file,
+    });
+    defer poller.deinit();
+
+    const stdout_reader = poller.reader(.stdout);
+    stdout_reader.buffer = stdout_list.allocatedSlice();
+    stdout_reader.seek = 0;
+    stdout_reader.end = stdout_list.items.len;
+
+    const stderr_reader = poller.reader(.stderr);
+    stderr_reader.buffer = stderr_list.allocatedSlice();
+    stderr_reader.seek = 0;
+    stderr_reader.end = stderr_list.items.len;
+
+    while (try poller.poll()) {
+        if (stdout_reader.bufferedLen() > max_stdout) return error.StdoutStreamTooLong;
+        if (stderr_reader.bufferedLen() > max_stderr) return error.StderrStreamTooLong;
+    }
+
+    const stdout_buffer = stdout_reader.buffer;
+    const stdout_end = stdout_reader.end;
+    const stderr_buffer = stderr_reader.buffer;
+    const stderr_end = stderr_reader.end;
+
+    stdout_reader.buffer = &.{};
+    stderr_reader.buffer = &.{};
+
+    stdout_list = .{
+        .items = stdout_buffer[0..stdout_end],
+        .capacity = stdout_buffer.len,
+    };
+    stderr_list = .{
+        .items = stderr_buffer[0..stderr_end],
+        .capacity = stderr_buffer.len,
+    };
+
+    return .{
+        .stdout = try stdout_list.toOwnedSlice(allocator),
+        .stderr = try stderr_list.toOwnedSlice(allocator),
+    };
 }
 
 fn runCodex(allocator: Allocator, prompt: []const u8) ![]u8 {
@@ -136,10 +200,9 @@ fn runCodex(allocator: Allocator, prompt: []const u8) ![]u8 {
         break :blk parseBufferLimit(env, 10 * 1024 * 1024);
     };
 
-    const stdout_bytes = try process.stdout.?.readToEndAlloc(allocator, max_stdout);
-    defer allocator.free(stdout_bytes);
-    const stderr_bytes = try process.stderr.?.readToEndAlloc(allocator, max_stderr);
-    defer allocator.free(stderr_bytes);
+    const output = try collectChildOutput(allocator, &process, max_stdout, max_stderr);
+    defer allocator.free(output.stdout);
+    defer allocator.free(output.stderr);
 
     const term = try process.wait();
     switch (term) {
@@ -147,11 +210,11 @@ fn runCodex(allocator: Allocator, prompt: []const u8) ![]u8 {
         else => return error.CodexFailed,
     }
 
-    if (stderr_bytes.len > 0) {
-        _ = try std.fs.File.stderr().writeAll(stderr_bytes);
+    if (output.stderr.len > 0) {
+        _ = try std.fs.File.stderr().writeAll(output.stderr);
     }
 
-    const message = try extractAgentMarkdown(allocator, stdout_bytes);
+    const message = try extractAgentMarkdown(allocator, output.stdout);
     return message;
 }
 
