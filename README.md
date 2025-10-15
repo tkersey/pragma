@@ -38,6 +38,25 @@ Operate as a release auditor.
 
 If both a format and a custom block are present, the block wins.
 
+## Install via Homebrew Tap
+
+This repository doubles as a Homebrew tap. To build `pragma` from the latest `main` branch using Homebrew:
+
+```bash
+brew tap tkersey/pragma https://github.com/tkersey/pragma
+brew install --HEAD tkersey/pragma/pragma
+```
+
+The formula fetches this repository, runs `zig build -Doptimize=ReleaseFast`, and installs the resulting binary. The `--HEAD` flag is currently required because we no longer ship notarized release archives; Homebrew builds from source instead.
+
+Need a reproducible build? After tapping, you can check out the tap to a specific commit and reinstall:
+
+```bash
+cd "$(brew --repo tkersey/pragma)"
+git checkout <commit>
+brew reinstall --HEAD tkersey/pragma/pragma
+```
+
 ## Scorecard Generation
 
 ```bash
@@ -47,24 +66,4 @@ zig build scorecard -- evaluations/runs/run-2025-10-15-1.jsonl run-2025-10-15-1
 
 Pass `-` instead of a file path to read JSONL from stdin. The second argument is optional and shows up as the run identifier in the output.
 
-## Releasing
-
-- The GitHub Actions workflow in `.github/workflows/release-macos.yml` builds a universal binary, signs it, notarizes the archive with `notarytool`, and uploads assets for any tag matching `v*`.
-- Follow `docs/RELEASE.md` to provision Apple certificates, configure repository secrets, and trigger notarized releases.
-
 When `zig` is unavailable you can still inspect `src/main.zig` to understand the prompt assembly pipeline and integrate similar logic elsewhere.
-
-## Homebrew Tap
-
-This repository doubles as a Homebrew tap. Once a release is published and the formula metadata is updated (see `docs/HOMEBREW.md`), Homebrew users can install `pragma` with:
-
-```bash
-brew tap tkersey/pragma https://github.com/tkersey/pragma
-brew install tkersey/pragma/pragma
-```
-
-For development or pre-release verification you can build directly from `main` by adding `--HEAD`:
-
-```bash
-brew install --HEAD tkersey/pragma/pragma
-```

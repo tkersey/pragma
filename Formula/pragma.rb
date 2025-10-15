@@ -8,7 +8,7 @@ class Pragma < Formula
   METADATA = begin
     metadata_path = Pathname(__dir__).join("pragma.json")
     metadata_path.exist? ? JSON.parse(metadata_path.read) : {}
-  end
+  end.freeze
 
   if (macos = METADATA["macos"]) && macos["url"] && macos["sha256"] && METADATA["version"]
     version METADATA["version"]
@@ -30,6 +30,7 @@ class Pragma < Formula
   end
 
   test do
-    assert_match "usage: pragma", shell_output("#{bin}/pragma", 0)
+    output = shell_output("#{bin}/pragma 2>&1")
+    assert_match "usage: pragma", output
   end
 end

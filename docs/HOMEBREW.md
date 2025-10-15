@@ -1,57 +1,54 @@
 # Homebrew Tap Guide
 
-This repository doubles as a Homebrew tap so macOS users can install `pragma` with `brew`. The tap lives in `Formula/pragma.rb` and can build from `main` (HEAD) or install prebuilt release binaries.
+This repository doubles as a Homebrew tap so macOS users can install `pragma` directly from source. The formula lives in `Formula/pragma.rb` and defaults to building the current `main` branch.
 
-## 1. Local smoke test (optional)
+## Install from the tap
 
 ```bash
 brew tap tkersey/pragma https://github.com/tkersey/pragma
 brew install --HEAD tkersey/pragma/pragma
-pragma --version  # ensure the binary runs
+pragma --version  # optional sanity check
 ```
 
-The `--HEAD` flag builds from source using the checked-in formula. Once a notarized release is published (see below) the flag is no longer required.
+The `--HEAD` flag is required because we no longer publish notarized release archives. Homebrew clones this repository, runs `zig build -Doptimize=ReleaseFast`, and installs the resulting binary.
 
-## 2. Cut a signed release
+## Validate local changes
 
-Follow `docs/RELEASE.md` to tag a version and let the `release-macos` workflow produce a notarized `pragma-macos.zip` plus a `.sha256` checksum. Those assets are uploaded to the matching GitHub release.
-
-## 3. Update the formula metadata
-
-After the workflow finishes:
-
-1. Download `pragma-macos.zip.sha256` from the release assets or copy it from `artifacts/pragma-macos.zip.sha256` in the workflow logs.
-2. Update `Formula/pragma.json` with the new version number and checksum:
-
-   ```json
-   {
-     "version": "0.2.0",
-     "macos": {
-       "url": "https://github.com/tkersey/pragma/releases/download/v0.2.0/pragma-macos.zip",
-       "sha256": "<sha256 from pragma-macos.zip.sha256>"
-     }
-   }
-   ```
-
-   Keep the `url` in sync with the release tag (including the leading `v`).
-3. Commit the change and push to `main` alongside the tag. Homebrew users can now run `brew install tkersey/pragma/pragma` without the `--HEAD` flag.
-
-## 4. Validating the tap
-
-Run these checks before announcing the release:
+The tap clone that Homebrew uses lives at `$(brew --repo tkersey/pragma)`. You can edit the formula there (or copy over your working copy) and then reinstall:
 
 ```bash
-brew uninstall pragma
-brew install tkersey/pragma/pragma
-brew test tkersey/pragma/pragma
+cd "$(brew --repo tkersey/pragma)"
+# edit Formula/pragma.rb or copy in a new version
+brew reinstall --HEAD tkersey/pragma/pragma
 ```
 
-`brew test` executes the `test do` block in the formula to confirm basic functionality.
+Homebrew will rebuild from source using whatever formula and project state exists in that directory.
 
-## 5. Common troubleshooting
+## Pin to a specific revision
 
-- **`Download failed`**: double-check the `url` in the formula matches the release tag (including the leading `v`).
-- **`SHA256 mismatch`**: recalculate the checksum locally with `shasum -a 256 pragma-macos.zip` and confirm it matches the release asset.
-- **`zig` not found when building HEAD**: ensure `depends_on "zig" => :build` remains in the formula so Homebrew installs Zig automatically.
+After tapping, the repository lives at `$(brew --repo tkersey/pragma)`. Check out whatever commit you want Homebrew to build from, then reinstall:
 
-With these steps in place, the repository serves as both the source tree and a Homebrew tap, giving users a one-liner installation path.
+```bash
+brew tap tkersey/pragma https://github.com/tkersey/pragma
+cd "$(brew --repo tkersey/pragma)"
+git checkout <commit-or-tag>
+brew reinstall --HEAD tkersey/pragma/pragma
+```
+
+## Optional metadata for future releases
+
+If you decide to ship prebuilt artifacts again, populate `Formula/pragma.json` with the version, download URL, and SHA256 checksum. When those fields are set the formula will install the archive instead of compiling from source.
+
+```bash
+scripts/update_formula.sh v0.3.0 https://example.com/pragma-macos.zip <sha256>
+```
+
+## Troubleshooting
+
+| Symptom | Resolution |
+| --- | --- |
+| `zig: command not found` during build | Homebrew should install Zig automatically via the `depends_on "zig" => :build` declaration. Install `brew install zig` manually if needed. |
+| Build fails with write permission errors | Make sure you are outside read-only sandboxes; Homebrew builds in its own staging area with write access. |
+| Want a clean reinstall | `brew uninstall pragma && brew install --HEAD tkersey/pragma/pragma`. |
+
+With these steps the repository remains both the source tree and its own tap, giving contributors and users a one-liner installation path that always matches the latest code.
