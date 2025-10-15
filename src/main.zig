@@ -3,6 +3,18 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const ManagedArrayList = std.array_list.Managed;
 const ArrayList = std.ArrayList;
+const builtin = @import("builtin");
+
+const test_support = struct {
+    pub var codex_override: ?[]const u8 = null;
+};
+
+const OutputContract = union(enum) {
+    markdown,
+    json,
+    plain,
+    custom: []const u8,
+};
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
@@ -21,9 +33,16 @@ pub fn main() !void {
         },
         else => return err,
     };
-    defer allocator.free(prompt_text);
 
-    const assembled = try assemblePrompt(allocator, prompt_text);
+    const extraction = try extractDirectiveContract(allocator, prompt_text);
+    allocator.free(prompt_text);
+    defer allocator.free(extraction.prompt);
+    defer switch (extraction.contract) {
+        .custom => |value| allocator.free(value),
+        else => {},
+    };
+
+    const assembled = try assemblePrompt(allocator, extraction.prompt, extraction.contract);
     defer allocator.free(assembled);
 
     const response = try runCodex(allocator, assembled);
@@ -34,33 +53,35 @@ pub fn main() !void {
     try stdout_file.writeAll("\n");
 }
 
+fn printUsage() !void {
+    try std.fs.File.stderr().writeAll(
+        "usage: pragma \"<system prompt>\"\n",
+    );
+}
+
 fn readPrompt(allocator: Allocator, args: *std.process.ArgIterator) ![]u8 {
-    const first = args.next() orelse return usageError();
+    const first = args.next() orelse return error.MissingPrompt;
 
     var buffer = ManagedArrayList(u8).init(allocator);
     defer buffer.deinit();
 
     try buffer.appendSlice(first);
 
-    while (true) {
-        const next_arg = args.next();
-        if (next_arg == null) break;
+    while (args.next()) |segment| {
         try buffer.append(' ');
-        try buffer.appendSlice(next_arg.?);
+        try buffer.appendSlice(segment);
     }
 
     return buffer.toOwnedSlice();
 }
 
-fn usageError() ![]u8 {
-    return error.MissingPrompt;
-}
+fn assemblePrompt(
+    allocator: Allocator,
+    system_prompt: []const u8,
+    contract: OutputContract,
+) ![]u8 {
+    const output_contract = renderOutputContract(contract);
 
-fn printUsage() !void {
-    try std.fs.File.stderr().writeAll("usage: pragma \"<system prompt>\"\n");
-}
-
-fn assemblePrompt(allocator: Allocator, system_prompt: []const u8) ![]u8 {
     return std.fmt.allocPrint(
         allocator,
         "## Pragma Sub-Agent Field Manual\n" ++
@@ -83,12 +104,7 @@ fn assemblePrompt(allocator: Allocator, system_prompt: []const u8) ![]u8 {
             "- Maintain an audit-friendly trail: commands run, artifacts touched, and any credentials or secrets intentionally avoided.\n" ++
             "\n" ++
             "### 4. Output Contract\n" ++
-            "- Respond in Markdown using this skeleton:\n" ++
-            "  - `## Result` — the finished deliverable (code blocks, diffs, specs, etc.).\n" ++
-            "  - `## Verification` — evidence of checks performed or gaps still open.\n" ++
-            "  - `## Assumptions` — bullet list of inferred context, if any.\n" ++
-            "  - `## Next Steps` (optional) — only if meaningful follow-up remains.\n" ++
-            "- Keep prose dense and unambiguous; avoid filler commentary.\n" ++
+            "{s}\n" ++
             "\n" ++
             "### 5. Quality & Safety Gates\n" ++
             "- Self-review for correctness, security, performance, and maintainability before responding.\n" ++
@@ -97,8 +113,295 @@ fn assemblePrompt(allocator: Allocator, system_prompt: []const u8) ![]u8 {
             "\n" ++
             "### Directive Uplink\n" ++
             "<directive>\n{s}\n</directive>",
-        .{system_prompt},
+        .{output_contract, system_prompt},
     );
+}
+
+fn renderOutputContract(contract: OutputContract) []const u8 {
+    const markdown = "- Respond in Markdown using this skeleton:\n"
+        ++ "  - `## Result` — the finished deliverable (code blocks, diffs, specs, etc.).\n"
+        ++ "  - `## Verification` — evidence of checks performed or gaps still open.\n"
+        ++ "  - `## Assumptions` — bullet list of inferred context, if any.\n"
+        ++ "  - `## Next Steps` (optional) — only if meaningful follow-up remains.\n"
+        ++ "- Keep prose dense and unambiguous; avoid filler commentary.\n";
+
+    const json = "- Respond with a single JSON object encoded as UTF-8.\n"
+        ++ "  - Include `result`, `verification`, and `assumptions` keys; each may contain nested structures as needed.\n"
+        ++ "  - Provide `next_steps` if meaningful actions remain, otherwise omit the field.\n"
+        ++ "- Do not emit any prose outside the JSON payload.\n";
+
+    const plain = "- Respond as concise plain text paragraphs.\n"
+        ++ "- Cover results, validation evidence, assumptions, and next steps in distinct paragraphs separated by blank lines.\n"
+        ++ "- Avoid markdown syntax unless explicitly requested inside the directive.\n";
+
+    return switch (contract) {
+        .markdown => markdown,
+        .json => json,
+        .plain => plain,
+        .custom => |value| value,
+    };
+}
+
+fn extractDirectiveContract(allocator: Allocator, raw_prompt: []const u8) !struct {
+    prompt: []u8,
+    contract: OutputContract,
+} {
+    var contract: OutputContract = .markdown;
+    var kept_lines = ManagedArrayList([]const u8).init(allocator);
+    defer kept_lines.deinit();
+
+    var block_lines = ManagedArrayList([]const u8).init(allocator);
+    defer block_lines.deinit();
+
+    var in_block = false;
+    var block_start_line: []const u8 = &.{};
+
+    var lines = std.mem.splitScalar(u8, raw_prompt, '\n');
+    while (lines.next()) |line_with_nl| {
+        const line = trimTrailingCr(line_with_nl);
+        const trimmed = std.mem.trim(u8, line, " \t");
+
+        if (in_block) {
+            if (std.mem.eql(u8, trimmed, "pragma-output-contract>>>")) {
+                in_block = false;
+
+                const custom_slice = try joinLines(allocator, block_lines.items);
+                if (custom_slice.len > 0) {
+                    setContract(&contract, allocator, OutputContract{ .custom = custom_slice });
+                } else {
+                    allocator.free(custom_slice);
+                }
+                block_lines.clearRetainingCapacity();
+                continue;
+            }
+
+            try block_lines.append(line);
+            continue;
+        }
+
+        if (std.mem.eql(u8, trimmed, "<<<pragma-output-contract")) {
+            in_block = true;
+            block_start_line = line;
+            block_lines.clearRetainingCapacity();
+            continue;
+        }
+
+        if (std.mem.startsWith(u8, trimmed, "pragma-output-contract:")) {
+            const value_slice = std.mem.trim(u8, trimmed["pragma-output-contract:".len..], " \t");
+            if (value_slice.len > 0) {
+                const copy = try allocator.dupe(u8, value_slice);
+                setContract(&contract, allocator, OutputContract{ .custom = copy });
+            } else {
+                try kept_lines.append(line);
+            }
+            continue;
+        }
+
+        if (std.mem.startsWith(u8, trimmed, "pragma-output-format:")) {
+            const value_slice = std.mem.trim(u8, trimmed["pragma-output-format:".len..], " \t");
+            if (value_slice.len == 0) {
+                try kept_lines.append(line);
+                continue;
+            }
+
+            if (parseOutputFormatValue(value_slice)) |fmt| {
+                setContract(&contract, allocator, fmt);
+                continue;
+            }
+
+            try kept_lines.append(line);
+            continue;
+        }
+
+        try kept_lines.append(line);
+    }
+
+    if (in_block) {
+        try kept_lines.append(block_start_line);
+        for (block_lines.items) |block_line| {
+            try kept_lines.append(block_line);
+        }
+    }
+
+    const sanitized = try joinLines(allocator, kept_lines.items);
+    return .{
+        .prompt = sanitized,
+        .contract = contract,
+    };
+}
+
+fn trimTrailingCr(line: []const u8) []const u8 {
+    if (line.len > 0 and line[line.len - 1] == '\r') {
+        return line[0 .. line.len - 1];
+    }
+    return line;
+}
+
+fn joinLines(allocator: Allocator, lines: []const []const u8) ![]u8 {
+    if (lines.len == 0) return allocator.dupe(u8, "");
+
+    var buffer = ManagedArrayList(u8).init(allocator);
+    defer buffer.deinit();
+
+    for (lines, 0..) |line, idx| {
+        try buffer.appendSlice(line);
+        if (idx + 1 < lines.len) {
+            try buffer.append('\n');
+        }
+    }
+
+    return buffer.toOwnedSlice();
+}
+
+fn parseOutputFormatValue(value: []const u8) ?OutputContract {
+    if (std.ascii.eqlIgnoreCase(value, "markdown")) return OutputContract.markdown;
+    if (std.ascii.eqlIgnoreCase(value, "json")) return OutputContract.json;
+    if (std.ascii.eqlIgnoreCase(value, "plain")) return OutputContract.plain;
+    return null;
+}
+
+fn setContract(contract_ptr: *OutputContract, allocator: Allocator, new_contract: OutputContract) void {
+    switch (contract_ptr.*) {
+        .custom => |existing| allocator.free(existing),
+        else => {},
+    }
+
+    contract_ptr.* = switch (new_contract) {
+        .custom => |value| OutputContract{ .custom = value },
+        .markdown => OutputContract.markdown,
+        .json => OutputContract.json,
+        .plain => OutputContract.plain,
+    };
+}
+
+test "extractDirectiveContract defaults to markdown with untouched prompt" {
+    const allocator = std.testing.allocator;
+    const raw = "Analyze repo state.";
+    const result = try extractDirectiveContract(allocator, raw);
+    defer allocator.free(result.prompt);
+    defer switch (result.contract) {
+        .custom => |value| allocator.free(value),
+        else => {},
+    };
+
+    try std.testing.expectEqualStrings(raw, result.prompt);
+    try std.testing.expect(result.contract == .markdown);
+}
+
+test "extractDirectiveContract parses format directive" {
+    const allocator = std.testing.allocator;
+    const raw =
+        \\pragma-output-format: json
+        \\Return snapshot.
+    ;
+    const result = try extractDirectiveContract(allocator, raw);
+    defer allocator.free(result.prompt);
+    defer switch (result.contract) {
+        .custom => |value| allocator.free(value),
+        else => {},
+    };
+
+    try std.testing.expectEqualStrings("Return snapshot.", result.prompt);
+    try std.testing.expect(result.contract == .json);
+}
+
+test "extractDirectiveContract parses custom block" {
+    const allocator = std.testing.allocator;
+    const raw =
+        \\<<<pragma-output-contract
+        \\Emit YAML with keys result, verification.
+        \\pragma-output-contract>>>
+        \\Do the thing.
+    ;
+    const result = try extractDirectiveContract(allocator, raw);
+    defer allocator.free(result.prompt);
+    defer switch (result.contract) {
+        .custom => |value| allocator.free(value),
+        else => {},
+    };
+
+    try std.testing.expectEqualStrings("Do the thing.", result.prompt);
+    try std.testing.expect(result.contract == .custom);
+    try std.testing.expectEqualStrings("Emit YAML with keys result, verification.", result.contract.custom);
+}
+
+test "extractDirectiveContract custom block overrides format line" {
+    const allocator = std.testing.allocator;
+    const raw =
+        \\pragma-output-format: json
+        \\<<<pragma-output-contract
+        \\Emit XML with sections result, verification.
+        \\pragma-output-contract>>>
+        \\Deliver report.
+    ;
+    const result = try extractDirectiveContract(allocator, raw);
+    defer allocator.free(result.prompt);
+    defer switch (result.contract) {
+        .custom => |value| allocator.free(value),
+        else => {},
+    };
+
+    try std.testing.expectEqualStrings("Deliver report.", result.prompt);
+    try std.testing.expect(result.contract == .custom);
+    try std.testing.expectEqualStrings("Emit XML with sections result, verification.", result.contract.custom);
+}
+
+test "extractDirectiveContract leaves unmatched block intact" {
+    const allocator = std.testing.allocator;
+    const raw =
+        \\<<<pragma-output-contract
+        \\Incomplete
+        \\message.
+    ;
+    const result = try extractDirectiveContract(allocator, raw);
+    defer allocator.free(result.prompt);
+    defer switch (result.contract) {
+        .custom => |value| allocator.free(value),
+        else => {},
+    };
+
+    try std.testing.expectEqualStrings(raw, result.prompt);
+    try std.testing.expect(result.contract == .markdown);
+}
+
+test "assemblePrompt injects json contract instructions" {
+    const allocator = std.testing.allocator;
+    const prompt = "Do something";
+    const assembled = try assemblePrompt(allocator, prompt, OutputContract.json);
+    defer allocator.free(assembled);
+
+    try std.testing.expect(std.mem.containsAtLeast(u8, assembled, 1, "Respond with a single JSON object"));
+    try std.testing.expect(std.mem.containsAtLeast(u8, assembled, 1, prompt));
+}
+
+test "runCodex honors PRAGMA_CODEX_BIN stub" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const script_name = "codex-stub.sh";
+    {
+        var file = try tmp.dir.createFile(script_name, .{ .read = true, .mode = 0o755 });
+        defer file.close();
+        try file.writeAll(
+            "#!/bin/sh\n"
+            ++ "cat <<'EOF'\n"
+            ++ "{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"Stub OK\"}}\n"
+            ++ "EOF\n",
+        );
+    }
+
+    const script_path = try tmp.dir.realpathAlloc(allocator, script_name);
+    defer allocator.free(script_path);
+
+    test_support.codex_override = script_path;
+    defer test_support.codex_override = null;
+
+    const response = try runCodex(allocator, "Hello");
+    defer allocator.free(response);
+
+    try std.testing.expectEqualStrings("Stub OK", response);
 }
 
 fn parseBufferLimit(value_str: []const u8, default: usize) usize {
@@ -169,19 +472,33 @@ fn collectChildOutput(
 }
 
 fn runCodex(allocator: Allocator, prompt: []const u8) ![]u8 {
-    const argv = [_][]const u8{
-        "codex",
-        "--search",
-        "--yolo",
-        "exec",
-        "--skip-git-repo-check",
-        "--json",
-        "-c",
-        "mcp_servers={}",
-        prompt,
+    const codex_env = std.process.getEnvVarOwned(allocator, "PRAGMA_CODEX_BIN") catch null;
+    defer if (codex_env) |value| allocator.free(value);
+
+    const codex_exec = blk: {
+        if (builtin.is_test) {
+            if (test_support.codex_override) |value| break :blk value;
+        }
+        break :blk codex_env orelse "codex";
     };
 
-    var process = std.process.Child.init(&argv, allocator);
+    var argv_builder = ManagedArrayList([]const u8).init(allocator);
+    defer argv_builder.deinit();
+
+    try argv_builder.append(codex_exec);
+    try argv_builder.append("--search");
+    try argv_builder.append("--yolo");
+    try argv_builder.append("exec");
+    try argv_builder.append("--skip-git-repo-check");
+    try argv_builder.append("--json");
+    try argv_builder.append("-c");
+    try argv_builder.append("mcp_servers={}");
+    try argv_builder.append(prompt);
+
+    const argv = try argv_builder.toOwnedSlice();
+    defer allocator.free(argv);
+
+    var process = std.process.Child.init(argv, allocator);
     process.stdin_behavior = .Ignore;
     process.stdout_behavior = .Pipe;
     process.stderr_behavior = .Pipe;

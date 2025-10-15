@@ -35,7 +35,7 @@ The workflow also uses the built-in `GITHUB_TOKEN` to upload release assets.
    git push origin v0.1.0
    ```
 3. The workflow runs on `macos-13`, installs Zig via Homebrew, builds both architectures, and runs `lipo` to create a universal binary.
-4. After codesigning, the workflow zips the binary, notarizes the archive with `xcrun notarytool submit --wait`, and uploads both the zip and its SHA-256 checksum to the matching GitHub Release.
+4. After codesigning, the workflow zips the binary, notarizes the archive with `xcrun notarytool submit --wait`, and uploads both the zip and its SHA-256 checksum to the matching GitHub Release. Copy the checksum for `Formula/pragma.json` (see `docs/HOMEBREW.md`).
 
 ## 4. Local validation (optional)
 

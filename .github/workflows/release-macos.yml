@@ -70,7 +70,7 @@ jobs:
         shell: bash
         run: |
           mkdir -p "$ARCHIVE_DIR"
-          ditto -c -k --keepParent dist/pragma "$ARCHIVE_DIR"/pragma-macos.zip
+          ditto -c -k dist/pragma "$ARCHIVE_DIR"/pragma-macos.zip
           shasum -a 256 "$ARCHIVE_DIR"/pragma-macos.zip > "$ARCHIVE_DIR"/pragma-macos.zip.sha256
 
       - name: Notarize archive
