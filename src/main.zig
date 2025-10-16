@@ -27,12 +27,81 @@ const CliInvocation = struct {
     directive: ?[]u8,
     directives_dir: ?[]u8,
     inline_prompt: ?[]u8,
+    validate_directives: bool,
 };
 
 const DirectiveDocument = struct {
     prompt: []u8,
     contract: OutputContract,
 };
+
+const ValidationIssue = struct {
+    path: []u8,
+    detail: []u8,
+};
+
+const ValidationStats = struct {
+    total: usize = 0,
+    skipped: usize = 0,
+    ok: usize = 0,
+};
+
+fn runDirectiveValidation(
+    allocator: Allocator,
+    cli_dir: ?[]const u8,
+    env_dir: ?[]const u8,
+) !void {
+    var directories = try gatherDirectiveDirectories(allocator, cli_dir, env_dir, true);
+    defer {
+        for (directories.items) |dir_path| allocator.free(dir_path);
+        directories.deinit();
+    }
+
+    if (directories.items.len == 0) {
+        const line = try std.fmt.allocPrint(allocator, "pragma: no directive directories discovered\n", .{});
+        defer allocator.free(line);
+        try std.fs.File.stdout().writeAll(line);
+        return;
+    }
+
+    var issues = ManagedArrayList(ValidationIssue).init(allocator);
+    defer {
+        for (issues.items) |issue| {
+            allocator.free(issue.path);
+            allocator.free(issue.detail);
+        }
+        issues.deinit();
+    }
+
+    var stats = ValidationStats{};
+    for (directories.items) |dir_path| {
+        try validateDirectiveDir(allocator, dir_path, "codex", &issues, &stats);
+    }
+
+    if (issues.items.len > 0) {
+        for (issues.items) |issue| {
+            const line = try std.fmt.allocPrint(allocator, "{s}: {s}\n", .{ issue.path, issue.detail });
+            defer allocator.free(line);
+            try std.fs.File.stderr().writeAll(line);
+        }
+        const summary = try std.fmt.allocPrint(
+            allocator,
+            "pragma: validation failed — {d} issue(s) across {d} directive(s)\n",
+            .{ issues.items.len, stats.total },
+        );
+        defer allocator.free(summary);
+        try std.fs.File.stderr().writeAll(summary);
+        return error.ValidationFailed;
+    }
+
+    const summary = try std.fmt.allocPrint(
+        allocator,
+        "Validated {d}/{d} directive(s); skipped {d} (prefix match).\n",
+        .{ stats.ok, stats.total, stats.skipped },
+    );
+    defer allocator.free(summary);
+    try std.fs.File.stdout().writeAll(summary);
+}
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
@@ -57,6 +126,18 @@ pub fn main() !void {
 
     const env_directives_dir = std.process.getEnvVarOwned(allocator, "PRAGMA_DIRECTIVES_DIR") catch null;
     defer if (env_directives_dir) |value| allocator.free(value);
+
+    if (invocation.validate_directives) {
+        runDirectiveValidation(
+            allocator,
+            invocation.directives_dir,
+            env_directives_dir,
+        ) catch |err| switch (err) {
+            error.ValidationFailed => return,
+            else => return err,
+        };
+        return;
+    }
 
     var extraction: DirectiveDocument = undefined;
     if (invocation.directive) |directive_name| {
@@ -110,7 +191,7 @@ pub fn main() !void {
 
 fn printUsage() !void {
     try std.fs.File.stderr().writeAll(
-        "usage: pragma [--directive NAME] [--directives-dir DIR] [--] \"<system prompt>\"\n",
+        "usage: pragma [--validate-directives] [--directive NAME] [--directives-dir DIR] [--] \"<system prompt>\"\n",
     );
 }
 
@@ -121,11 +202,21 @@ fn parseCliInvocation(allocator: Allocator, args: *std.process.ArgIterator) !Cli
     defer prompt_buffer.deinit();
 
     var reading_prompt = false;
+    var invocation = CliInvocation{
+        .directive = null,
+        .directives_dir = null,
+        .inline_prompt = null,
+        .validate_directives = false,
+    };
 
     while (args.next()) |raw_arg| {
         if (!reading_prompt and raw_arg.len > 0 and raw_arg[0] == '-') {
             if (std.mem.eql(u8, raw_arg, "--")) {
                 reading_prompt = true;
+                continue;
+            }
+            if (std.mem.eql(u8, raw_arg, "--validate-directives")) {
+                invocation.validate_directives = true;
                 continue;
             }
             if (std.mem.eql(u8, raw_arg, "--directive")) {
@@ -166,16 +257,12 @@ fn parseCliInvocation(allocator: Allocator, args: *std.process.ArgIterator) !Cli
         try prompt_buffer.appendSlice(raw_arg);
     }
 
-    const inline_prompt = if (prompt_buffer.items.len == 0)
-        null
-    else
-        try prompt_buffer.toOwnedSlice();
+    const inline_prompt = if (prompt_buffer.items.len == 0) null else try prompt_buffer.toOwnedSlice();
 
-    return .{
-        .directive = directive,
-        .directives_dir = directives_dir,
-        .inline_prompt = inline_prompt,
-    };
+    invocation.directive = directive;
+    invocation.directives_dir = directives_dir;
+    invocation.inline_prompt = inline_prompt;
+    return invocation;
 }
 
 fn loadDirectiveDocument(
@@ -315,15 +402,153 @@ fn findDirectiveInHome(
     allocator: Allocator,
     name: []const u8,
 ) !?[]u8 {
-    const home_opt = std.process.getEnvVarOwned(allocator, "HOME") catch null;
-    if (home_opt == null) return null;
-    const home = home_opt.?;
+    const home_dir = try homeDirectivesPath(allocator) orelse return null;
+    defer allocator.free(home_dir);
+    return try findDirectiveInDir(allocator, home_dir, name);
+}
+
+fn gatherDirectiveDirectories(
+    allocator: Allocator,
+    cli_dir: ?[]const u8,
+    env_dir: ?[]const u8,
+    include_defaults: bool,
+) !ManagedArrayList([]u8) {
+    var list = ManagedArrayList([]u8).init(allocator);
+
+    if (cli_dir) |dir| try appendUniqueDir(allocator, &list, dir);
+    if (env_dir) |dir| try appendUniqueDir(allocator, &list, dir);
+
+    if (include_defaults) {
+        if (try homeDirectivesPath(allocator)) |home_path| {
+            defer allocator.free(home_path);
+            try appendUniqueDir(allocator, &list, home_path);
+        }
+
+        try appendUniqueDir(allocator, &list, ".pragma/directives");
+        try appendUniqueDir(allocator, &list, "directives");
+    }
+
+    return list;
+}
+
+fn appendUniqueDir(
+    allocator: Allocator,
+    list: *ManagedArrayList([]u8),
+    dir: []const u8,
+) !void {
+    for (list.items) |existing| {
+        if (std.mem.eql(u8, existing, dir)) return;
+    }
+
+    const copy = try allocator.dupe(u8, dir);
+    try list.append(copy);
+}
+
+fn homeDirectivesPath(allocator: Allocator) !?[]u8 {
+    const home_env = std.process.getEnvVarOwned(allocator, "HOME") catch null;
+    if (home_env == null) return null;
+    const home = home_env.?;
     defer allocator.free(home);
 
-    const home_dir = try std.fs.path.join(allocator, &.{ home, ".pragma", "directives" });
-    defer allocator.free(home_dir);
+    const joined = try std.fs.path.join(allocator, &.{ home, ".pragma", "directives" });
+    return joined;
+}
 
-    return try findDirectiveInDir(allocator, home_dir, name);
+fn validateDirectiveDir(
+    allocator: Allocator,
+    dir_path: []const u8,
+    skip_prefix: []const u8,
+    issues: *ManagedArrayList(ValidationIssue),
+    stats: *ValidationStats,
+) !void {
+    var dir = (if (std.fs.path.isAbsolute(dir_path))
+        std.fs.openDirAbsolute(dir_path, .{ .iterate = true })
+    else
+        std.fs.cwd().openDir(dir_path, .{ .iterate = true })) catch |err| switch (err) {
+        error.FileNotFound => return,
+        error.NotDir => return,
+        else => return err,
+    };
+    defer dir.close();
+
+    var it = dir.iterate();
+    while (try it.next()) |entry| {
+        if (entry.kind != .file) continue;
+
+        const ext = std.fs.path.extension(entry.name);
+        if (!std.mem.eql(u8, ext, ".md") and !std.mem.eql(u8, ext, ".markdown")) continue;
+
+        const base_len = entry.name.len - ext.len;
+        const base = entry.name[0..base_len];
+        if (std.ascii.startsWithIgnoreCase(base, skip_prefix)) {
+            stats.skipped += 1;
+            continue;
+        }
+
+        stats.total += 1;
+
+        const content = dir.readFileAlloc(allocator, entry.name, 4 * 1024 * 1024) catch {
+            try recordIssue(allocator, issues, dir_path, entry.name, "failed to read file");
+            continue;
+        };
+        defer allocator.free(content);
+
+        const trimmed = std.mem.trim(u8, content, " \r\n");
+        if (trimmed.len == 0) {
+            try recordIssue(allocator, issues, dir_path, entry.name, "body is empty");
+            continue;
+        }
+
+        const sections = splitDirectiveDocument(content) catch |err| switch (err) {
+            error.InvalidDirective => {
+                try recordIssue(allocator, issues, dir_path, entry.name, "malformed frontmatter block");
+                continue;
+            },
+            else => return err,
+        };
+
+        if (sections.frontmatter) |front| {
+            const contract_override = parseDirectiveFrontmatter(allocator, front) catch {
+                try recordIssue(allocator, issues, dir_path, entry.name, "invalid YAML frontmatter");
+                continue;
+            };
+            defer if (contract_override) |value| switch (value) {
+                .custom => |text| allocator.free(text),
+                else => {},
+            };
+        }
+
+        const doc_result = extractDirectiveContract(allocator, sections.body) catch {
+            try recordIssue(allocator, issues, dir_path, entry.name, "invalid inline pragma directives");
+            continue;
+        };
+        defer allocator.free(doc_result.prompt);
+        defer switch (doc_result.contract) {
+            .custom => |value| allocator.free(value),
+            else => {},
+        };
+
+        if (std.mem.trim(u8, doc_result.prompt, " \r\n").len == 0) {
+            try recordIssue(allocator, issues, dir_path, entry.name, "directive body reduced to empty after sanitization");
+            continue;
+        }
+
+        stats.ok += 1;
+    }
+}
+
+fn recordIssue(
+    allocator: Allocator,
+    issues: *ManagedArrayList(ValidationIssue),
+    dir_path: []const u8,
+    file_name: []const u8,
+    message: []const u8,
+) !void {
+    const combined = try std.fs.path.join(allocator, &.{ dir_path, file_name });
+    defer allocator.free(combined);
+    const path_copy = try allocator.dupe(u8, combined);
+    const detail_copy = try allocator.dupe(u8, message);
+    try issues.append(.{ .path = path_copy, .detail = detail_copy });
 }
 
 fn splitDirectiveDocument(content: []const u8) !struct {
@@ -672,6 +897,54 @@ test "loadDirectiveDocument reads file and merges inline prompt" {
     try std.testing.expect(std.mem.indexOfScalar(u8, doc.prompt, '\n') != null);
     try std.testing.expect(std.mem.containsAtLeast(u8, doc.prompt, 1, "You are a reviewer."));
     try std.testing.expect(std.mem.containsAtLeast(u8, doc.prompt, 1, extra));
+}
+
+test "validateDirectiveDir reports malformed files" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makeDir("directives");
+    {
+        var file = try tmp.dir.createFile("directives/good.md", .{});
+        defer file.close();
+        try file.writeAll(
+            "---\n" ++ "output_contract: markdown\n" ++ "---\n" ++ "Provide a summary.\n",
+        );
+    }
+    {
+        var file = try tmp.dir.createFile("directives/bad.md", .{});
+        defer file.close();
+        try file.writeAll(
+            "---\n" ++ "output_contract: json\n" ++ "missing terminator\n" ++ "Provide detail.\n",
+        );
+    }
+    {
+        var file = try tmp.dir.createFile("directives/codex-special.md", .{});
+        defer file.close();
+        try file.writeAll("Some content\n");
+    }
+
+    const dir_path = try tmp.dir.realpathAlloc(allocator, "directives");
+    defer allocator.free(dir_path);
+
+    var issues = ManagedArrayList(ValidationIssue).init(allocator);
+    defer {
+        for (issues.items) |issue| {
+            allocator.free(issue.path);
+            allocator.free(issue.detail);
+        }
+        issues.deinit();
+    }
+
+    var stats = ValidationStats{};
+    try validateDirectiveDir(allocator, dir_path, "codex", &issues, &stats);
+
+    try std.testing.expect(stats.total == 2);
+    try std.testing.expect(stats.ok == 1);
+    try std.testing.expect(stats.skipped == 1);
+    try std.testing.expect(issues.items.len == 1);
+    try std.testing.expect(std.mem.containsAtLeast(u8, issues.items[0].path, 1, "bad.md"));
 }
 
 test "extractDirectiveContract defaults to markdown with untouched prompt" {

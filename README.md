@@ -22,6 +22,9 @@ zig build run -- "Act as a focused CSS sub-agent. Return a markdown checklist."
 
 # Reuse a stored directive and append task-specific context
 zig build run -- --directive review -- "Concentrate on the latest database migration."
+
+# Validate stored directives (skips names starting with "codex")
+zig build run -- --validate-directives
 ```
 
 If the sub-agent needs environment or repository details, include them in the system prompt you pass to `pragma` (or instruct the agent to request them explicitly). When running by directive, any extra CLI text (after `--`) is appended after a blank line inside the directive body.
