@@ -129,12 +129,53 @@ fn parseLog(allocator: Allocator, input_path: []const u8) !ParseOutput {
 fn readInput(allocator: Allocator, input_path: []const u8) ![]u8 {
     if (std.mem.eql(u8, input_path, "-")) {
         const stdin_file = std.fs.File.stdin();
-        return stdin_file.readToEndAlloc(allocator, std.math.maxInt(usize));
+        return readStream(allocator, stdin_file);
     }
 
     const file = try std.fs.cwd().openFile(input_path, .{ .mode = .read_only });
     defer file.close();
-    return file.readToEndAlloc(allocator, std.math.maxInt(usize));
+    return readStream(allocator, file);
+}
+
+fn readStream(allocator: Allocator, file: std.fs.File) ![]u8 {
+    var list = std.ArrayList(u8).empty;
+    errdefer list.deinit(allocator);
+
+    var temp: [4096]u8 = undefined;
+    while (true) {
+        const amt = try file.read(&temp);
+        if (amt == 0) break;
+        try list.appendSlice(allocator, temp[0..amt]);
+    }
+
+    return list.toOwnedSlice(allocator);
+}
+
+test "readStream handles large files without truncation" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var file = try tmp.dir.createFile("large.log", .{ .read = true });
+    defer file.close();
+
+    var chunk: [4096]u8 = undefined;
+    @memset(&chunk, 'A');
+
+    const repeat_count: usize = 8;
+    var expected_len: usize = 0;
+    for (0..repeat_count) |_| {
+        try file.writeAll(&chunk);
+        expected_len += chunk.len;
+    }
+
+    try file.seekTo(0);
+    const content = try readStream(allocator, file);
+    defer allocator.free(content);
+
+    try std.testing.expectEqual(expected_len, content.len);
+    try std.testing.expectEqual(@as(u8, 'A'), content[0]);
+    try std.testing.expectEqual(@as(u8, 'A'), content[content.len - 1]);
 }
 
 fn handleEvent(
@@ -222,7 +263,6 @@ fn handleEvent(
         try result.commands.append(arena_allocator, record);
         return;
     }
-
 }
 
 fn containsCaseInsensitive(haystack: []const u8, needle: []const u8) bool {
@@ -344,7 +384,7 @@ fn renderCommandSection(
     for (commands) |cmd| {
         try writer.print(
             "- `{s}` (status: {s}",
-            .{cmd.command, cmd.status},
+            .{ cmd.command, cmd.status },
         );
         if (cmd.exit_code) |code| {
             try writer.print(", exit: {d}", .{code});

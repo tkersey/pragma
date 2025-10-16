@@ -4,7 +4,10 @@ const Allocator = std.mem.Allocator;
 const ManagedArrayList = std.array_list.Managed;
 const ArrayList = std.ArrayList;
 const builtin = @import("builtin");
-const ymlz = @import("ymlz");
+const parallel_module = if (builtin.os.tag == .windows)
+    @import("parallel_windows.zig")
+else
+    @import("parallel_posix.zig");
 
 const test_support = struct {
     pub var codex_override: ?[]const u8 = null;
@@ -29,6 +32,7 @@ const CliInvocation = struct {
     inline_prompt: ?[]u8,
     validate_directives: bool,
     manifest: ?[]u8,
+    keep_run_artifacts: bool,
 };
 
 const DirectiveDocument = struct {
@@ -47,13 +51,13 @@ const ValidationStats = struct {
     ok: usize = 0,
 };
 
-const ManifestTask = struct {
+pub const ManifestTask = struct {
     name: ?[]const u8 = null,
     directive: ?[]const u8 = null,
     prompt: ?[]const u8 = null,
 };
 
-const ManifestStep = struct {
+pub const ManifestStep = struct {
     name: ?[]const u8 = null,
     directive: ?[]const u8 = null,
     prompt: ?[]const u8 = null,
@@ -61,13 +65,13 @@ const ManifestStep = struct {
     tasks: ?[]ManifestTask = null,
 };
 
-const ManifestDocument = struct {
+pub const ManifestDocument = struct {
     core_prompt: ?[]const u8 = null,
     directive: ?[]const u8 = null,
     steps: []ManifestStep = &.{},
 };
 
-const ManifestTaskView = struct {
+pub const ManifestTaskView = struct {
     step_name: ?[]const u8,
     task_name: ?[]const u8,
     directive: []const u8,
@@ -80,19 +84,326 @@ const ManifestTaskCollection = struct {
     parallel: bool,
 };
 
-const ParallelTaskContext = struct {
-    allocator: Allocator,
-    directive: []const u8,
-    cli_dir: ?[]const u8,
-    env_dir: ?[]const u8,
-    core_prompt: ?[]const u8,
-    step_prompt: ?[]const u8,
-    task_prompt: ?[]const u8,
-    label_step: ?[]const u8,
-    label_task: ?[]const u8,
-    response: ?[]u8,
-    err: ?anyerror = null,
+const ParallelHelpers = struct {
+    buildInlinePrompt: fn (Allocator, []const ?[]const u8) anyerror!?[]u8,
+    loadDirectiveDocument: fn (Allocator, []const u8, ?[]const u8, ?[]const u8, ?[]const u8) anyerror!DirectiveDocument,
+    assemblePrompt: fn (Allocator, []const u8, OutputContract) anyerror![]u8,
+    buildCodexCommand: fn (Allocator, []const u8) anyerror!CodexCommand,
+    runCodex: fn (Allocator, *RunContext, []const u8, []const u8) anyerror![]u8,
+    extractAgentMarkdown: fn (Allocator, []const u8) anyerror![]u8,
 };
+
+const parallel_helpers = ParallelHelpers{
+    .buildInlinePrompt = buildInlinePrompt,
+    .loadDirectiveDocument = loadDirectiveDocument,
+    .assemblePrompt = assemblePrompt,
+    .buildCodexCommand = buildCodexCommand,
+    .runCodex = runCodex,
+    .extractAgentMarkdown = extractAgentMarkdown,
+};
+
+pub const CodexCommand = struct {
+    argv: []const []const u8,
+    env_value: ?[]u8,
+};
+
+const SpillKind = enum { stdout, stderr };
+
+pub const RunContext = struct {
+    spill_stdout_limit: usize,
+    spill_stderr_limit: usize,
+    preview_limit: usize,
+    keep_artifacts: bool,
+    force_keep: bool,
+    retain_limit: usize,
+    root_path: []u8,
+    run_path: ?[]u8 = null,
+    counter: usize = 0,
+    prune_done: bool = false,
+
+    pub fn init(allocator: Allocator, keep_artifacts: bool) !RunContext {
+        const stdout_limit = parseSizeEnv(allocator, "PRAGMA_SPILL_STDOUT", 1024 * 1024);
+        const stderr_limit = parseSizeEnv(allocator, "PRAGMA_SPILL_STDERR", 512 * 1024);
+        const retain_limit = parseSizeEnv(allocator, "PRAGMA_RUN_HISTORY", 20);
+        const root = try resolveArtifactsRoot(allocator);
+        errdefer allocator.free(root);
+        try ensureDirectoryExists(root);
+        return RunContext{
+            .spill_stdout_limit = stdout_limit,
+            .spill_stderr_limit = stderr_limit,
+            .preview_limit = 4 * 1024,
+            .keep_artifacts = keep_artifacts,
+            .force_keep = false,
+            .retain_limit = retain_limit,
+            .root_path = root,
+        };
+    }
+
+    pub fn deinit(self: *RunContext, allocator: Allocator) void {
+        if (self.run_path) |path| {
+            if (!(self.keep_artifacts or self.force_keep)) {
+                _ = std.fs.deleteTreeAbsolute(path) catch {};
+            }
+            allocator.free(path);
+            self.run_path = null;
+        }
+        allocator.free(self.root_path);
+        self.root_path = &.{};
+    }
+
+    fn ensureRunDir(self: *RunContext, allocator: Allocator) ![]const u8 {
+        if (self.run_path) |path| return path;
+
+        if (!self.prune_done) {
+            try pruneOldRunsBeforeNew(allocator, self.root_path, self.retain_limit);
+            self.prune_done = true;
+        }
+
+        var random_bytes: [4]u8 = undefined;
+        std.crypto.random.bytes(&random_bytes);
+        const timestamp = std.time.timestamp();
+        const hex_bytes = std.fmt.bytesToHex(random_bytes, .lower);
+        const dir_name = try std.fmt.allocPrint(allocator, "{d}-{s}", .{ timestamp, hex_bytes[0..] });
+        defer allocator.free(dir_name);
+
+        var root_dir = try std.fs.openDirAbsolute(self.root_path, .{});
+        defer root_dir.close();
+
+        root_dir.makeDir(dir_name) catch |err| switch (err) {
+            error.PathAlreadyExists => {},
+            else => return err,
+        };
+
+        const run_path = try std.fs.path.join(allocator, &.{ self.root_path, dir_name });
+        self.run_path = run_path;
+        self.counter = 0;
+        return run_path;
+    }
+
+    fn nextArtifactPath(self: *RunContext, allocator: Allocator, label: []const u8, kind: SpillKind) ![]u8 {
+        const run_dir = try self.ensureRunDir(allocator);
+        const slug = try slugifyLabel(allocator, label);
+        defer allocator.free(slug);
+
+        self.counter += 1;
+        const kind_suffix = switch (kind) {
+            .stdout => "stdout",
+            .stderr => "stderr",
+        };
+        const file_name = try std.fmt.allocPrint(
+            allocator,
+            "{:0>3}-{s}.{s}.log",
+            .{ self.counter, slug, kind_suffix },
+        );
+        defer allocator.free(file_name);
+
+        const path = try std.fs.path.join(allocator, &.{ run_dir, file_name });
+        return path;
+    }
+
+    fn writeArtifact(self: *RunContext, allocator: Allocator, label: []const u8, kind: SpillKind, content: []const u8) ![]u8 {
+        const path = try self.nextArtifactPath(allocator, label, kind);
+        errdefer allocator.free(path);
+        var file = try std.fs.createFileAbsolute(path, .{ .truncate = true, .mode = 0o600 });
+        defer file.close();
+        try file.writeAll(content);
+        self.force_keep = true;
+        return path;
+    }
+
+    pub fn handleStdout(self: *RunContext, allocator: Allocator, label: []const u8, content: []const u8) !void {
+        if (self.spill_stdout_limit == 0 or content.len <= self.spill_stdout_limit) return;
+
+        const path = try self.writeArtifact(allocator, label, .stdout, content);
+        defer allocator.free(path);
+
+        const human = try formatBytes(allocator, content.len);
+        defer allocator.free(human);
+
+        const message = try std.fmt.allocPrint(
+            allocator,
+            "pragma: stdout for {s} exceeded {s}; full log: {s}\n",
+            .{ label, human, path },
+        );
+        defer allocator.free(message);
+        try std.fs.File.stderr().writeAll(message);
+    }
+
+    pub fn handleStderr(self: *RunContext, allocator: Allocator, label: []const u8, content: []const u8) !void {
+        if (content.len == 0) return;
+        if (self.spill_stderr_limit == 0 or content.len <= self.spill_stderr_limit) {
+            try std.fs.File.stderr().writeAll(content);
+            return;
+        }
+
+        const preview_len = @min(self.preview_limit, content.len);
+        if (preview_len > 0) {
+            try std.fs.File.stderr().writeAll(content[0..preview_len]);
+            if (content[preview_len - 1] != '\n') {
+                try std.fs.File.stderr().writeAll("\n");
+            }
+        }
+
+        const path = try self.writeArtifact(allocator, label, .stderr, content);
+        defer allocator.free(path);
+
+        const human = try formatBytes(allocator, content.len);
+        defer allocator.free(human);
+
+        const notice = try std.fmt.allocPrint(
+            allocator,
+            "pragma: stderr for {s} truncated to {d} byte preview ({s} total); full log: {s}\n",
+            .{ label, preview_len, human, path },
+        );
+        defer allocator.free(notice);
+        try std.fs.File.stderr().writeAll(notice);
+    }
+};
+
+fn parseSizeEnv(allocator: Allocator, name: []const u8, default_value: usize) usize {
+    const env = std.process.getEnvVarOwned(allocator, name) catch return default_value;
+    defer allocator.free(env);
+    return parseBufferLimit(env, default_value);
+}
+
+fn parseBoolEnv(allocator: Allocator, name: []const u8, default_value: bool) bool {
+    const env = std.process.getEnvVarOwned(allocator, name) catch return default_value;
+    defer allocator.free(env);
+    if (env.len == 0) return default_value;
+    if (std.ascii.eqlIgnoreCase(env, "1") or std.ascii.eqlIgnoreCase(env, "true") or std.ascii.eqlIgnoreCase(env, "yes")) {
+        return true;
+    }
+    if (std.ascii.eqlIgnoreCase(env, "0") or std.ascii.eqlIgnoreCase(env, "false") or std.ascii.eqlIgnoreCase(env, "no")) {
+        return false;
+    }
+    return default_value;
+}
+
+fn resolveArtifactsRoot(allocator: Allocator) ![]u8 {
+    if (std.process.getEnvVarOwned(allocator, "PRAGMA_RUN_ROOT") catch null) |raw_value| {
+        defer allocator.free(raw_value);
+        if (std.fs.path.isAbsolute(raw_value)) {
+            return allocator.dupe(u8, raw_value);
+        } else {
+            const cwd = try std.fs.cwd().realpathAlloc(allocator, ".");
+            defer allocator.free(cwd);
+            return std.fs.path.join(allocator, &.{ cwd, raw_value });
+        }
+    }
+
+    if (std.process.getEnvVarOwned(allocator, "HOME") catch null) |home| {
+        defer allocator.free(home);
+        return std.fs.path.join(allocator, &.{ home, ".pragma", "runs" });
+    }
+
+    const cwd = try std.fs.cwd().realpathAlloc(allocator, ".");
+    defer allocator.free(cwd);
+    return std.fs.path.join(allocator, &.{ cwd, ".pragma", "runs" });
+}
+
+fn ensureDirectoryExists(path: []const u8) !void {
+    if (std.fs.path.isAbsolute(path)) {
+        std.fs.makeDirAbsolute(path) catch |err| switch (err) {
+            error.PathAlreadyExists => {},
+            else => return err,
+        };
+    } else {
+        std.fs.cwd().makePath(path) catch |err| switch (err) {
+            error.PathAlreadyExists => {},
+            else => return err,
+        };
+    }
+}
+
+fn slugifyLabel(allocator: Allocator, raw: []const u8) ![]u8 {
+    const trimmed = std.mem.trim(u8, raw, " \r\n\t");
+    var buffer = ManagedArrayList(u8).init(allocator);
+    errdefer buffer.deinit();
+
+    var last_was_sep = false;
+    var count: usize = 0;
+    var it = trimmed;
+    if (it.len == 0) {
+        try buffer.appendSlice("task");
+        return try buffer.toOwnedSlice();
+    }
+
+    while (count < 48 and it.len > 0) : (count += 1) {
+        const ch = it[0];
+        it = it[1..];
+        if (std.ascii.isAlphanumeric(ch)) {
+            try buffer.append(std.ascii.toLower(ch));
+            last_was_sep = false;
+            continue;
+        }
+        if (!last_was_sep) {
+            try buffer.append('_');
+            last_was_sep = true;
+        }
+    }
+
+    if (buffer.items.len == 0) {
+        try buffer.appendSlice("task");
+    } else if (last_was_sep) {
+        buffer.items[buffer.items.len - 1] = '_';
+    }
+
+    return buffer.toOwnedSlice();
+}
+
+fn formatBytes(allocator: Allocator, size: usize) ![]u8 {
+    const kb = 1024;
+    const mb = kb * 1024;
+    if (size >= mb) {
+        const whole = size / mb;
+        const tenths = (size % mb) * 10 / mb;
+        return std.fmt.allocPrint(allocator, "{d}.{d} MB", .{ whole, tenths });
+    } else if (size >= kb) {
+        const whole = size / kb;
+        const tenths = (size % kb) * 10 / kb;
+        return std.fmt.allocPrint(allocator, "{d}.{d} KB", .{ whole, tenths });
+    }
+    return std.fmt.allocPrint(allocator, "{d} B", .{size});
+}
+
+fn pruneOldRunsBeforeNew(allocator: Allocator, root_path: []const u8, retain_limit: usize) !void {
+    var dir = std.fs.openDirAbsolute(root_path, .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound => return,
+        else => return err,
+    };
+    defer dir.close();
+
+    var entries = ManagedArrayList([]u8).init(allocator);
+    errdefer {
+        for (entries.items) |item| allocator.free(item);
+        entries.deinit();
+    }
+
+    var it = dir.iterate();
+    while (try it.next()) |entry| {
+        if (entry.kind != .directory) continue;
+        const copy = try allocator.dupe(u8, entry.name);
+        try entries.append(copy);
+    }
+
+    const target_existing: usize = if (retain_limit == 0) 0 else if (retain_limit > 0) retain_limit - 1 else 0;
+    if (entries.items.len <= target_existing) return;
+
+    std.sort.heap([]u8, entries.items, {}, struct {
+        fn lessThan(_: void, lhs: []u8, rhs: []u8) bool {
+            return std.mem.lessThan(u8, lhs, rhs);
+        }
+    }.lessThan);
+
+    const to_remove = entries.items.len - target_existing;
+    var idx: usize = 0;
+    while (idx < to_remove) : (idx += 1) {
+        const name = entries.items[idx];
+        const target = try std.fs.path.join(allocator, &.{ root_path, name });
+        defer allocator.free(target);
+        _ = std.fs.deleteTreeAbsolute(target) catch {};
+    }
+}
 
 fn runDirectiveValidation(
     allocator: Allocator,
@@ -156,17 +467,14 @@ fn executeManifest(
     manifest_path: []const u8,
     cli_dir: ?[]const u8,
     env_dir: ?[]const u8,
+    run_ctx: *RunContext,
 ) !void {
     const max_size: usize = 4 * 1024 * 1024;
-    const manifest_bytes = try std.fs.cwd().readFileAlloc(allocator, manifest_path, max_size);
+    const manifest_bytes = try std.fs.cwd().readFileAlloc(manifest_path, allocator, std.Io.Limit.limited(max_size));
     defer allocator.free(manifest_bytes);
 
-    var parser = try ymlz.Ymlz(ManifestDocument).init(allocator);
-    const doc = parser.loadRaw(manifest_bytes) catch {
-        parser.deinit(ManifestDocument{ .steps = &.{} });
-        return error.InvalidDirective;
-    };
-    defer parser.deinit(doc);
+    var doc = try parseManifestDocument(allocator, manifest_bytes);
+    defer deinitManifestDocument(allocator, doc);
 
     if (doc.steps.len == 0) {
         try std.fs.File.stderr().writeAll("pragma: manifest must define at least one step\n");
@@ -197,6 +505,7 @@ fn executeManifest(
         if (tasks_list.parallel) {
             try executeParallelTasks(
                 allocator,
+                run_ctx,
                 &doc,
                 &step,
                 cli_dir,
@@ -209,6 +518,7 @@ fn executeManifest(
                     allocator,
                     &doc,
                     &step,
+                    run_ctx,
                     cli_dir,
                     env_dir,
                     task_view,
@@ -216,6 +526,176 @@ fn executeManifest(
             }
         }
     }
+}
+
+fn parseManifestDocument(allocator: Allocator, raw: []const u8) !ManifestDocument {
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, raw, .{});
+    defer parsed.deinit();
+
+    const root_obj = switch (parsed.value) {
+        .object => |obj| obj,
+        else => return error.InvalidDirective,
+    };
+
+    var result = ManifestDocument{
+        .core_prompt = null,
+        .directive = null,
+        .steps = &.{},
+    };
+
+    if (root_obj.get("core_prompt")) |node| {
+        const value = switch (node) {
+            .string => |s| s,
+            else => return error.InvalidDirective,
+        };
+        result.core_prompt = try allocator.dupe(u8, value);
+    }
+
+    if (root_obj.get("directive")) |node| {
+        const value = switch (node) {
+            .string => |s| s,
+            else => return error.InvalidDirective,
+        };
+        result.directive = try allocator.dupe(u8, value);
+    }
+
+    const steps_node = root_obj.get("steps") orelse return error.InvalidDirective;
+    const steps_array = switch (steps_node) {
+        .array => |arr| arr,
+        else => return error.InvalidDirective,
+    };
+
+    var steps = ManagedArrayList(ManifestStep).init(allocator);
+    errdefer {
+        for (steps.items) |step| freeManifestStep(allocator, step);
+        steps.deinit();
+    }
+
+    for (steps_array.items) |step_node| {
+        const step_obj = switch (step_node) {
+            .object => |obj| obj,
+            else => return error.InvalidDirective,
+        };
+
+        var step = ManifestStep{};
+        var step_added = false;
+        errdefer if (!step_added) freeManifestStep(allocator, step);
+
+        if (step_obj.get("name")) |name_node| {
+            const value = switch (name_node) {
+                .string => |s| s,
+                else => return error.InvalidDirective,
+            };
+            step.name = try allocator.dupe(u8, value);
+        }
+
+        if (step_obj.get("directive")) |node| {
+            const value = switch (node) {
+                .string => |s| s,
+                else => return error.InvalidDirective,
+            };
+            step.directive = try allocator.dupe(u8, value);
+        }
+
+        if (step_obj.get("prompt")) |node| {
+            const value = switch (node) {
+                .string => |s| s,
+                else => return error.InvalidDirective,
+            };
+            step.prompt = try allocator.dupe(u8, value);
+        }
+
+        if (step_obj.get("parallel")) |node| {
+            step.parallel = switch (node) {
+                .bool => |b| b,
+                else => return error.InvalidDirective,
+            };
+        }
+
+        if (step_obj.get("tasks")) |tasks_node| {
+            const tasks_array = switch (tasks_node) {
+                .array => |arr| arr,
+                else => return error.InvalidDirective,
+            };
+
+            var tasks_list = ManagedArrayList(ManifestTask).init(allocator);
+            errdefer {
+                for (tasks_list.items) |task| freeManifestTask(allocator, task);
+                tasks_list.deinit();
+            }
+
+            for (tasks_array.items) |task_node| {
+                const task_obj = switch (task_node) {
+                    .object => |obj| obj,
+                    else => return error.InvalidDirective,
+                };
+
+                var task = ManifestTask{};
+                var task_added = false;
+                errdefer if (!task_added) freeManifestTask(allocator, task);
+
+                if (task_obj.get("name")) |name_node| {
+                    const value = switch (name_node) {
+                        .string => |s| s,
+                        else => return error.InvalidDirective,
+                    };
+                    task.name = try allocator.dupe(u8, value);
+                }
+
+                if (task_obj.get("directive")) |node| {
+                    const value = switch (node) {
+                        .string => |s| s,
+                        else => return error.InvalidDirective,
+                    };
+                    task.directive = try allocator.dupe(u8, value);
+                }
+
+                if (task_obj.get("prompt")) |node| {
+                    const value = switch (node) {
+                        .string => |s| s,
+                        else => return error.InvalidDirective,
+                    };
+                    task.prompt = try allocator.dupe(u8, value);
+                }
+
+                try tasks_list.append(task);
+                task_added = true;
+            }
+
+            const tasks_slice = try tasks_list.toOwnedSlice();
+            step.tasks = tasks_slice;
+        }
+
+        try steps.append(step);
+        step_added = true;
+    }
+
+    const steps_slice = try steps.toOwnedSlice();
+    result.steps = steps_slice;
+    return result;
+}
+
+fn freeManifestTask(allocator: Allocator, task: ManifestTask) void {
+    if (task.name) |value| allocator.free(value);
+    if (task.directive) |value| allocator.free(value);
+    if (task.prompt) |value| allocator.free(value);
+}
+
+fn freeManifestStep(allocator: Allocator, step: ManifestStep) void {
+    if (step.name) |value| allocator.free(value);
+    if (step.directive) |value| allocator.free(value);
+    if (step.prompt) |value| allocator.free(value);
+    if (step.tasks) |tasks_slice| {
+        for (tasks_slice) |task| freeManifestTask(allocator, task);
+        allocator.free(tasks_slice);
+    }
+}
+
+fn deinitManifestDocument(allocator: Allocator, doc: ManifestDocument) void {
+    if (doc.core_prompt) |value| allocator.free(value);
+    if (doc.directive) |value| allocator.free(value);
+    for (doc.steps) |step| freeManifestStep(allocator, step);
+    if (doc.steps.len != 0) allocator.free(doc.steps);
 }
 
 fn collectManifestTasks(
@@ -265,7 +745,7 @@ fn collectManifestTasks(
     };
 }
 
-fn buildInlinePrompt(
+pub fn buildInlinePrompt(
     allocator: Allocator,
     segments: []const ?[]const u8,
 ) !?[]u8 {
@@ -293,6 +773,7 @@ fn executeSerialTask(
     allocator: Allocator,
     doc: *const ManifestDocument,
     step: *const ManifestStep,
+    run_ctx: *RunContext,
     cli_dir: ?[]const u8,
     env_dir: ?[]const u8,
     task_view: ManifestTaskView,
@@ -325,8 +806,9 @@ fn executeSerialTask(
     const assembled = try assemblePrompt(allocator, directive_doc.prompt, directive_doc.contract);
     defer allocator.free(assembled);
 
-    const response = runCodex(allocator, assembled) catch |err| {
-        const label = task_view.task_name orelse task_view.directive;
+    const label = task_view.task_name orelse task_view.directive;
+
+    const response = runCodex(allocator, run_ctx, label, assembled) catch |err| {
         const msg = try std.fmt.allocPrint(allocator, "pragma: step {s} codex error ({s})\n", .{ label, @errorName(err) });
         defer allocator.free(msg);
         try std.fs.File.stderr().writeAll(msg);
@@ -334,7 +816,6 @@ fn executeSerialTask(
     };
     defer allocator.free(response);
 
-    const label = task_view.task_name orelse task_view.directive;
     const header = try std.fmt.allocPrint(allocator, "--- Task: {s} (directive: {s})\n", .{ label, task_view.directive });
     defer allocator.free(header);
     try std.fs.File.stdout().writeAll(header);
@@ -344,105 +825,14 @@ fn executeSerialTask(
 
 fn executeParallelTasks(
     allocator: Allocator,
+    run_ctx: *RunContext,
     doc: *const ManifestDocument,
     step: *const ManifestStep,
     cli_dir: ?[]const u8,
     env_dir: ?[]const u8,
     tasks: *ManagedArrayList(ManifestTaskView),
 ) !void {
-    var contexts = ManagedArrayList(ParallelTaskContext).init(allocator);
-    defer contexts.deinit();
-
-    const thread_allocator: Allocator = std.heap.page_allocator;
-
-    for (tasks.items) |task_view| {
-        try contexts.append(.{
-            .allocator = thread_allocator,
-            .directive = task_view.directive,
-            .cli_dir = cli_dir,
-            .env_dir = env_dir,
-            .core_prompt = doc.core_prompt,
-            .step_prompt = step.prompt,
-            .task_prompt = task_view.prompt,
-            .label_step = step.name,
-            .label_task = task_view.task_name,
-            .response = null,
-            .err = null,
-        });
-    }
-
-    var threads = ManagedArrayList(std.Thread).init(allocator);
-    defer threads.deinit();
-
-    for (contexts.items) |*ctx| {
-        const thread = try std.Thread.spawn(.{}, manifestTaskThread, .{ctx});
-        try threads.append(thread);
-    }
-
-    for (threads.items) |thread| {
-        thread.join();
-    }
-
-    for (contexts.items) |*ctx| {
-        if (ctx.err) |err| {
-            const label = ctx.label_task orelse ctx.directive;
-            const msg = try std.fmt.allocPrint(allocator, "pragma: parallel task {s} failed ({s})\n", .{ label, @errorName(err) });
-            defer allocator.free(msg);
-            try std.fs.File.stderr().writeAll(msg);
-            return err;
-        }
-    }
-
-    for (contexts.items) |*ctx| {
-        const label = ctx.label_task orelse ctx.directive;
-        const header = try std.fmt.allocPrint(allocator, "--- Parallel Task: {s} (directive: {s})\n", .{ label, ctx.directive });
-        defer allocator.free(header);
-        try std.fs.File.stdout().writeAll(header);
-        if (ctx.response) |resp| {
-            defer ctx.allocator.free(resp);
-            try std.fs.File.stdout().writeAll(resp);
-        }
-        try std.fs.File.stdout().writeAll("\n");
-    }
-}
-
-fn manifestTaskThread(ctx: *ParallelTaskContext) void {
-    var segments = [_]?[]const u8{ ctx.core_prompt, ctx.step_prompt, ctx.task_prompt };
-    const extra = buildInlinePrompt(ctx.allocator, &segments) catch |err| {
-        ctx.err = err;
-        return;
-    };
-    defer if (extra) |value| ctx.allocator.free(value);
-
-    const mut_extra = if (extra) |value| value else null;
-
-    const directive_doc = loadDirectiveDocument(
-        ctx.allocator,
-        ctx.directive,
-        ctx.cli_dir,
-        ctx.env_dir,
-        mut_extra,
-    ) catch |err| {
-        ctx.err = err;
-        return;
-    };
-    defer ctx.allocator.free(directive_doc.prompt);
-    defer switch (directive_doc.contract) {
-        .custom => |value| ctx.allocator.free(value),
-        else => {},
-    };
-
-    const assembled = assemblePrompt(ctx.allocator, directive_doc.prompt, directive_doc.contract) catch |err| {
-        ctx.err = err;
-        return;
-    };
-    defer ctx.allocator.free(assembled);
-
-    const response = runCodex(ctx.allocator, assembled) catch |err| {
-        ctx.err = err;
-        return;
-    };
-    ctx.response = response;
+    return parallel_module.executeParallelTasks(allocator, &parallel_helpers, run_ctx, doc, step, cli_dir, env_dir, tasks);
 }
 
 pub fn main() !void {
@@ -474,6 +864,8 @@ pub fn main() !void {
     const env_directives_dir = std.process.getEnvVarOwned(allocator, "PRAGMA_DIRECTIVES_DIR") catch null;
     defer if (env_directives_dir) |value| allocator.free(value);
 
+    const keep_env = parseBoolEnv(allocator, "PRAGMA_KEEP_RUN", false);
+
     if (invocation.validate_directives) {
         runDirectiveValidation(
             allocator,
@@ -491,7 +883,9 @@ pub fn main() !void {
             try std.fs.File.stderr().writeAll("pragma: --manifest cannot be combined with inline prompts or --directive\n");
             return;
         }
-        try executeManifest(allocator, manifest_path, invocation.directives_dir, env_directives_dir);
+        var run_ctx = try RunContext.init(allocator, keep_env or invocation.keep_run_artifacts);
+        defer run_ctx.deinit(allocator);
+        try executeManifest(allocator, manifest_path, invocation.directives_dir, env_directives_dir, &run_ctx);
         return;
     }
 
@@ -537,7 +931,12 @@ pub fn main() !void {
     const assembled = try assemblePrompt(allocator, extraction.prompt, extraction.contract);
     defer allocator.free(assembled);
 
-    const response = try runCodex(allocator, assembled);
+    var run_ctx = try RunContext.init(allocator, keep_env or invocation.keep_run_artifacts);
+    defer run_ctx.deinit(allocator);
+
+    const run_label: []const u8 = if (invocation.directive) |value| value else "prompt";
+
+    const response = try runCodex(allocator, &run_ctx, run_label, assembled);
     defer allocator.free(response);
 
     const stdout_file = std.fs.File.stdout();
@@ -547,7 +946,7 @@ pub fn main() !void {
 
 fn printUsage() !void {
     try std.fs.File.stderr().writeAll(
-        "usage: pragma [--validate-directives] [--manifest FILE] [--directive NAME] [--directives-dir DIR] [--] \"<system prompt>\"\n",
+        "usage: pragma [--validate-directives] [--manifest FILE] [--directive NAME] [--directives-dir DIR] [--keep-run-artifacts] [--] \"<system prompt>\"\n",
     );
 }
 
@@ -564,6 +963,7 @@ fn parseCliInvocation(allocator: Allocator, args: *std.process.ArgIterator) !Cli
         .inline_prompt = null,
         .validate_directives = false,
         .manifest = null,
+        .keep_run_artifacts = false,
     };
 
     while (args.next()) |raw_arg| {
@@ -574,6 +974,10 @@ fn parseCliInvocation(allocator: Allocator, args: *std.process.ArgIterator) !Cli
             }
             if (std.mem.eql(u8, raw_arg, "--validate-directives")) {
                 invocation.validate_directives = true;
+                continue;
+            }
+            if (std.mem.eql(u8, raw_arg, "--keep-run-artifacts")) {
+                invocation.keep_run_artifacts = true;
                 continue;
             }
             if (std.mem.eql(u8, raw_arg, "--manifest")) {
@@ -635,7 +1039,7 @@ fn parseCliInvocation(allocator: Allocator, args: *std.process.ArgIterator) !Cli
     return invocation;
 }
 
-fn loadDirectiveDocument(
+pub fn loadDirectiveDocument(
     allocator: Allocator,
     directive_name: []const u8,
     cli_dir: ?[]const u8,
@@ -646,7 +1050,7 @@ fn loadDirectiveDocument(
     defer allocator.free(path);
 
     const max_size: usize = 4 * 1024 * 1024;
-    const content = try std.fs.cwd().readFileAlloc(allocator, path, max_size);
+    const content = try std.fs.cwd().readFileAlloc(path, allocator, std.Io.Limit.limited(max_size));
     defer allocator.free(content);
 
     const sections = try splitDirectiveDocument(content);
@@ -857,7 +1261,7 @@ fn validateDirectiveDir(
 
         stats.total += 1;
 
-        const content = dir.readFileAlloc(allocator, entry.name, 4 * 1024 * 1024) catch {
+        const content = dir.readFileAlloc(entry.name, allocator, std.Io.Limit.limited(4 * 1024 * 1024)) catch {
             try recordIssue(allocator, issues, dir_path, entry.name, "failed to read file");
             continue;
         };
@@ -962,20 +1366,67 @@ fn splitDirectiveDocument(content: []const u8) !struct {
 }
 
 fn parseDirectiveFrontmatter(allocator: Allocator, raw: []const u8) !?OutputContract {
-    var parser = try ymlz.Ymlz(DirectiveFrontmatter).init(allocator);
-    const metadata = parser.loadRaw(raw) catch {
-        return error.InvalidDirective;
-    };
-    defer parser.deinit(metadata);
+    var lines = std.ArrayList([]const u8).empty;
+    defer lines.deinit(allocator);
 
-    if (metadata.output_contract) |value| {
-        const has_newline = std.mem.indexOfScalar(u8, value, '\n') != null;
-        const normalized = if (has_newline)
-            std.mem.trimRight(u8, value, " \r\n")
-        else
-            std.mem.trim(u8, value, " \t\r\n");
-        if (normalized.len == 0) return null;
+    var splitter = std.mem.splitScalar(u8, raw, '\n');
+    while (splitter.next()) |line| {
+        try lines.append(allocator, line);
+    }
 
+    var idx: usize = 0;
+    while (idx < lines.items.len) {
+        const trimmed_line = std.mem.trim(u8, lines.items[idx], " \t\r");
+        if (trimmed_line.len == 0 or trimmed_line[0] == '#') {
+            idx += 1;
+            continue;
+        }
+
+        const colon_index = std.mem.indexOfScalar(u8, trimmed_line, ':') orelse {
+            idx += 1;
+            continue;
+        };
+
+        const key = std.mem.trim(u8, trimmed_line[0..colon_index], " \t");
+        var rest = std.mem.trim(u8, trimmed_line[colon_index + 1 ..], " \t");
+
+        if (!std.mem.eql(u8, key, "output_contract")) {
+            idx += 1;
+            continue;
+        }
+
+        if (rest.len > 0 and (rest[0] == '|' or rest[0] == '>')) {
+            idx += 1;
+            var buffer = std.ArrayList(u8).empty;
+            defer buffer.deinit(allocator);
+
+            while (idx < lines.items.len) {
+                const original = std.mem.trimRight(u8, lines.items[idx], "\r");
+
+                if (original.len == 0) {
+                    if (buffer.items.len > 0) try buffer.append(allocator, '\n');
+                    idx += 1;
+                    continue;
+                }
+
+                if (original[0] != ' ' and original[0] != '\t') break;
+
+                const content = std.mem.trimLeft(u8, original, " \t");
+                if (buffer.items.len > 0) try buffer.append(allocator, '\n');
+                try buffer.appendSlice(allocator, content);
+                idx += 1;
+            }
+
+            const block_text = try buffer.toOwnedSlice(allocator);
+            return OutputContract{ .custom = block_text };
+        }
+
+        if (rest.len == 0) {
+            idx += 1;
+            continue;
+        }
+
+        const normalized = std.mem.trim(u8, rest, "\"");
         if (parseOutputFormatValue(normalized)) |fmt| {
             return fmt;
         }
@@ -1013,7 +1464,7 @@ fn joinDirectiveAndInline(
     return buffer.toOwnedSlice();
 }
 
-fn assemblePrompt(
+pub fn assemblePrompt(
     allocator: Allocator,
     system_prompt: []const u8,
     contract: OutputContract,
@@ -1338,45 +1789,59 @@ test "executeManifest runs serial and parallel tasks" {
     defer allocator.free(directives_path);
 
     const manifest_content =
-        \\directive: review
-        \\core_prompt: |
-        \\  Shared context
-        \\steps:
-        \\  - name: Serial Review
-        \\    prompt: |
-        \\      Focus on the latest changes.
-        \\  - name: Parallel Checks
-        \\    parallel: true
-        \\    tasks:
-        \\      - name: Check A
-        \\        prompt: Look for syntax issues.
-        \\      - name: Check B
-        \\        prompt: Inspect documentation.
+        \\{
+        \\  "directive": "review",
+        \\  "core_prompt": "Shared context",
+        \\  "steps": [
+        \\    {
+        \\      "name": "Serial Review",
+        \\      "prompt": "Focus on the latest changes."
+        \\    },
+        \\    {
+        \\      "name": "Parallel Checks",
+        \\      "parallel": true,
+        \\      "tasks": [
+        \\        {
+        \\          "name": "Check A",
+        \\          "prompt": "Look for syntax issues."
+        \\        },
+        \\        {
+        \\          "name": "Check B",
+        \\          "prompt": "Inspect documentation."
+        \\        }
+        \\      ]
+        \\    }
+        \\  ]
+        \\}
     ;
 
     {
-        var file = try tmp.dir.createFile("plan.yml", .{});
+        var file = try tmp.dir.createFile("plan.json", .{});
         defer file.close();
         try file.writeAll(manifest_content);
     }
-    const manifest_path = try tmp.dir.realpathAlloc(allocator, "plan.yml");
+    const manifest_path = try tmp.dir.realpathAlloc(allocator, "plan.json");
     defer allocator.free(manifest_path);
 
-    {
+    const use_real_codex = std.process.hasEnvVar(allocator, "PRAGMA_TEST_REAL_CODEX") catch false;
+    if (!use_real_codex) {
         var file = try tmp.dir.createFile("codex-stub.sh", .{ .read = true, .mode = 0o755 });
         defer file.close();
         try file.writeAll(
             "#!/bin/sh\n" ++ "cat <<'EOF'\n" ++ "{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"Stub Manifest OK\"}}\n" ++ "EOF\n",
         );
+
+        const stub_path = try tmp.dir.realpathAlloc(allocator, "codex-stub.sh");
+        defer allocator.free(stub_path);
+
+        test_support.codex_override = stub_path;
+        defer test_support.codex_override = null;
     }
 
-    const stub_path = try tmp.dir.realpathAlloc(allocator, "codex-stub.sh");
-    defer allocator.free(stub_path);
+    var run_ctx = try RunContext.init(allocator, false);
+    defer run_ctx.deinit(allocator);
 
-    test_support.codex_override = stub_path;
-    defer test_support.codex_override = null;
-
-    try executeManifest(allocator, manifest_path, directives_path, null);
+    try executeManifest(allocator, manifest_path, directives_path, null, &run_ctx);
 }
 
 test "extractDirectiveContract defaults to markdown with untouched prompt" {
@@ -1482,28 +1947,118 @@ test "assemblePrompt injects json contract instructions" {
 test "runCodex honors PRAGMA_CODEX_BIN stub" {
     const allocator = std.testing.allocator;
 
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
+    var run_ctx = try RunContext.init(allocator, false);
+    defer run_ctx.deinit(allocator);
 
-    const script_name = "codex-stub.sh";
-    {
-        var file = try tmp.dir.createFile(script_name, .{ .read = true, .mode = 0o755 });
-        defer file.close();
-        try file.writeAll(
-            "#!/bin/sh\n" ++ "cat <<'EOF'\n" ++ "{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"Stub OK\"}}\n" ++ "EOF\n",
-        );
+    if (std.process.hasEnvVar(allocator, "PRAGMA_TEST_REAL_CODEX") catch false) {
+        const response = try runCodex(allocator, &run_ctx, "test", "Hello");
+        defer allocator.free(response);
+        try std.testing.expect(response.len > 0);
+    } else {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+
+        const script_name = "codex-stub.sh";
+        {
+            var file = try tmp.dir.createFile(script_name, .{ .read = true, .mode = 0o755 });
+            defer file.close();
+            try file.writeAll(
+                "#!/bin/sh\n" ++ "cat <<'EOF'\n" ++ "{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"Stub OK\"}}\n" ++ "EOF\n",
+            );
+        }
+
+        const script_path = try tmp.dir.realpathAlloc(allocator, script_name);
+        defer allocator.free(script_path);
+
+        test_support.codex_override = script_path;
+        defer test_support.codex_override = null;
+
+        const response = try runCodex(allocator, &run_ctx, "test", "Hello");
+        defer allocator.free(response);
+
+        try std.testing.expectEqualStrings("Stub OK", response);
+    }
+}
+
+test "RunContext spills stdout to disk when over limit" {
+    const allocator = std.testing.allocator;
+    var ctx = try RunContext.init(allocator, false);
+    defer {
+        ctx.force_keep = false;
+        ctx.deinit(allocator);
     }
 
-    const script_path = try tmp.dir.realpathAlloc(allocator, script_name);
-    defer allocator.free(script_path);
+    ctx.spill_stdout_limit = 32;
 
-    test_support.codex_override = script_path;
-    defer test_support.codex_override = null;
+    var data: [64]u8 = undefined;
+    @memset(&data, 'A');
 
-    const response = try runCodex(allocator, "Hello");
-    defer allocator.free(response);
+    try ctx.handleStdout(allocator, "spill-test", &data);
 
-    try std.testing.expectEqualStrings("Stub OK", response);
+    try std.testing.expect(ctx.run_path != null);
+    const run_dir = ctx.run_path.?;
+
+    var dir = try std.fs.openDirAbsolute(run_dir, .{ .iterate = true });
+    defer dir.close();
+
+    var found = false;
+    var it = dir.iterate();
+    while (try it.next()) |entry| {
+        if (entry.kind != .file) continue;
+        const file_path = try std.fs.path.join(allocator, &.{ run_dir, entry.name });
+        defer allocator.free(file_path);
+        var file = try std.fs.openFileAbsolute(file_path, .{ .mode = .read_only });
+        defer file.close();
+
+        var buffer: [64]u8 = undefined;
+        const read_amt = try file.readAll(&buffer);
+        try std.testing.expectEqual(@as(usize, data.len), read_amt);
+        try std.testing.expect(std.mem.eql(u8, buffer[0..read_amt], data[0..]));
+        found = true;
+    }
+
+    try std.testing.expect(found);
+}
+
+test "RunContext spills stderr to disk when over limit" {
+    const allocator = std.testing.allocator;
+    var ctx = try RunContext.init(allocator, false);
+    defer {
+        ctx.force_keep = false;
+        ctx.deinit(allocator);
+    }
+
+    ctx.spill_stderr_limit = 16;
+
+    var data: [48]u8 = undefined;
+    @memset(&data, 'B');
+
+    try ctx.handleStderr(allocator, "stderr-spill", &data);
+
+    try std.testing.expect(ctx.run_path != null);
+    const run_dir = ctx.run_path.?;
+
+    var dir = try std.fs.openDirAbsolute(run_dir, .{ .iterate = true });
+    defer dir.close();
+
+    var found = false;
+    var it = dir.iterate();
+    while (try it.next()) |entry| {
+        if (entry.kind != .file) continue;
+        if (!std.mem.endsWith(u8, entry.name, ".stderr.log")) continue;
+        const file_path = try std.fs.path.join(allocator, &.{ run_dir, entry.name });
+        defer allocator.free(file_path);
+        var file = try std.fs.openFileAbsolute(file_path, .{ .mode = .read_only });
+        defer file.close();
+
+        var buffer: [48]u8 = undefined;
+        const read_amt = try file.readAll(&buffer);
+        try std.testing.expectEqual(@as(usize, data.len), read_amt);
+        try std.testing.expect(std.mem.eql(u8, buffer[0..read_amt], data[0..]));
+        found = true;
+    }
+
+    try std.testing.expect(found);
 }
 
 fn parseBufferLimit(value_str: []const u8, default: usize) usize {
@@ -1573,9 +2128,8 @@ fn collectChildOutput(
     };
 }
 
-fn runCodex(allocator: Allocator, prompt: []const u8) ![]u8 {
+pub fn buildCodexCommand(allocator: Allocator, prompt: []const u8) !CodexCommand {
     const codex_env = std.process.getEnvVarOwned(allocator, "PRAGMA_CODEX_BIN") catch null;
-    defer if (codex_env) |value| allocator.free(value);
 
     const codex_exec = blk: {
         if (builtin.is_test) {
@@ -1600,9 +2154,19 @@ fn runCodex(allocator: Allocator, prompt: []const u8) ![]u8 {
     try argv_builder.append(prompt);
 
     const argv = try argv_builder.toOwnedSlice();
-    defer allocator.free(argv);
 
-    var process = std.process.Child.init(argv, allocator);
+    return .{
+        .argv = argv,
+        .env_value = codex_env,
+    };
+}
+
+pub fn runCodex(allocator: Allocator, run_ctx: *RunContext, label: []const u8, prompt: []const u8) ![]u8 {
+    var cmd = try buildCodexCommand(allocator, prompt);
+    defer if (cmd.env_value) |value| allocator.free(value);
+    defer allocator.free(cmd.argv);
+
+    var process = std.process.Child.init(cmd.argv, allocator);
     process.stdin_behavior = .Ignore;
     process.stdout_behavior = .Pipe;
     process.stderr_behavior = .Pipe;
@@ -1631,15 +2195,14 @@ fn runCodex(allocator: Allocator, prompt: []const u8) ![]u8 {
         else => return error.CodexFailed,
     }
 
-    if (output.stderr.len > 0) {
-        _ = try std.fs.File.stderr().writeAll(output.stderr);
-    }
+    try run_ctx.handleStdout(allocator, label, output.stdout);
+    try run_ctx.handleStderr(allocator, label, output.stderr);
 
     const message = try extractAgentMarkdown(allocator, output.stdout);
     return message;
 }
 
-fn extractAgentMarkdown(allocator: Allocator, stream: []const u8) ![]u8 {
+pub fn extractAgentMarkdown(allocator: Allocator, stream: []const u8) ![]u8 {
     var last: ?[]u8 = null;
 
     var it = std.mem.splitScalar(u8, stream, '\n');

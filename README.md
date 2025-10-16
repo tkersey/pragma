@@ -10,7 +10,7 @@
 ## Build
 
 ```bash
-# Requires Zig 0.11+ (install via Homebrew: brew install zig)
+# Requires Zig 0.16.0-dev.732+2f3234c76 (install via zigup: brew install zigup && zigup 0.16.0-dev.732+2f3234c76)
 zig build
 ```
 
@@ -26,8 +26,11 @@ zig build run -- --directive review -- "Concentrate on the latest database migra
 # Validate stored directives (skips names starting with "codex")
 zig build run -- --validate-directives
 
+# Keep run artifacts even if no spill files were needed
+zig build run -- --keep-run-artifacts --directive review -- "Capture the full codex transcript."
+
 # Execute a multi-step manifest
-zig build run -- --manifest plans/release.yml
+zig build run -- --manifest plans/release.json
 ```
 
 If the sub-agent needs environment or repository details, include them in the system prompt you pass to `pragma` (or instruct the agent to request them explicitly). When running by directive, any extra CLI text (after `--`) is appended after a blank line inside the directive body.
@@ -75,26 +78,39 @@ Frontmatter currently recognizes `output_contract`. Set it to `markdown`, `json`
 
 ### Manifests
 
-Pragma can orchestrate multi-step workflows from a YAML manifest. Each manifest defines an optional `core_prompt`, an optional default `directive`, and a `steps` array. Steps run serially by default; set `parallel: true` to execute the nested `tasks` concurrently.
+Pragma orchestrates multi-step workflows from a JSON manifest. Each manifest defines an optional `core_prompt`, an optional default `directive`, and a `steps` array. Steps run serially by default; set `"parallel": true` on a step to fan out the nested `"tasks"` concurrently.
 
-```yaml
-directive: review
-core_prompt: |
-  Shared context for every task.
-steps:
-  - name: Serial Review
-    prompt: |
-      Focus on the latest changes.
-  - name: Parallel Checks
-    parallel: true
-    tasks:
-      - name: Check A
-        prompt: Look for syntax issues.
-      - name: Check B
-        prompt: Inspect documentation.
+```json
+{
+  "directive": "review",
+  "core_prompt": "Shared context for every task.",
+  "steps": [
+    {
+      "name": "Serial Review",
+      "prompt": "Focus on the latest changes."
+    },
+    {
+      "name": "Parallel Checks",
+      "parallel": true,
+      "tasks": [
+        { "name": "Check A", "prompt": "Look for syntax issues." },
+        { "name": "Check B", "prompt": "Inspect documentation." }
+      ]
+    }
+  ]
+}
 ```
 
-Each step or task may override the `directive` and supply additional prompt text. Parallel groups launch dedicated subprocesses and aggregate their outputs once every task completes.
+Each step or task may override the `directive` and supply additional prompt text. On POSIX platforms, parallel groups launch dedicated `codex` subprocesses and stream results via `std.Io.poll`. Windows currently falls back to a thread-per-task model while the async I/O implementation catches up.
+
+### Run Artifacts
+
+Pragma watches the raw Codex streams and automatically offloads large payloads to disk:
+
+- stdout above 1 MiB or stderr above 512 KiB is saved under `~/.pragma/runs/<timestamp>/`, and the CLI prints a notice pointing to the exact file.
+- The in-terminal view stays concise: stderr previews are capped at 4 KiB, and stdout continues to show only the final agent message.
+- Override the thresholds with `PRAGMA_SPILL_STDOUT` and `PRAGMA_SPILL_STDERR` (byte counts). Adjust history pruning with `PRAGMA_RUN_HISTORY` (defaults to the 20 most recent runs).
+- Use `--keep-run-artifacts` or `PRAGMA_KEEP_RUN=1` to retain logs even when nothing overflowed, e.g. for hand-off to another tool.
 
 ## Install via Homebrew Tap
 
