@@ -1580,6 +1580,8 @@ fn runCodex(allocator: Allocator, prompt: []const u8) ![]u8 {
     const codex_exec = blk: {
         if (builtin.is_test) {
             if (test_support.codex_override) |value| break :blk value;
+            if (codex_env) |value| break :blk value;
+            break :blk "/bin/echo";
         }
         break :blk codex_env orelse "codex";
     };
