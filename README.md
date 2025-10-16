@@ -25,6 +25,9 @@ zig build run -- --directive review -- "Concentrate on the latest database migra
 
 # Validate stored directives (skips names starting with "codex")
 zig build run -- --validate-directives
+
+# Execute a multi-step manifest
+zig build run -- --manifest plans/release.yml
 ```
 
 If the sub-agent needs environment or repository details, include them in the system prompt you pass to `pragma` (or instruct the agent to request them explicitly). When running by directive, any extra CLI text (after `--`) is appended after a blank line inside the directive body.
@@ -69,6 +72,29 @@ Place directive files in one of the following locations (first match wins):
 You can also provide an absolute or relative file path directly via `--directive`, e.g. `--directive ./my/agents/security.md`.
 
 Frontmatter currently recognizes `output_contract`. Set it to `markdown`, `json`, or `plain`, or supply a multi-line block scalar to define a custom contract. Inline `pragma-output-format:` / `pragma-output-contract` markers embedded in the directive body continue to work and take precedence if present.
+
+### Manifests
+
+Pragma can orchestrate multi-step workflows from a YAML manifest. Each manifest defines an optional `core_prompt`, an optional default `directive`, and a `steps` array. Steps run serially by default; set `parallel: true` to execute the nested `tasks` concurrently.
+
+```yaml
+directive: review
+core_prompt: |
+  Shared context for every task.
+steps:
+  - name: Serial Review
+    prompt: |
+      Focus on the latest changes.
+  - name: Parallel Checks
+    parallel: true
+    tasks:
+      - name: Check A
+        prompt: Look for syntax issues.
+      - name: Check B
+        prompt: Inspect documentation.
+```
+
+Each step or task may override the `directive` and supply additional prompt text. Parallel groups launch dedicated subprocesses and aggregate their outputs once every task completes.
 
 ## Install via Homebrew Tap
 

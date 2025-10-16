@@ -28,6 +28,7 @@ const CliInvocation = struct {
     directives_dir: ?[]u8,
     inline_prompt: ?[]u8,
     validate_directives: bool,
+    manifest: ?[]u8,
 };
 
 const DirectiveDocument = struct {
@@ -44,6 +45,53 @@ const ValidationStats = struct {
     total: usize = 0,
     skipped: usize = 0,
     ok: usize = 0,
+};
+
+const ManifestTask = struct {
+    name: ?[]const u8 = null,
+    directive: ?[]const u8 = null,
+    prompt: ?[]const u8 = null,
+};
+
+const ManifestStep = struct {
+    name: ?[]const u8 = null,
+    directive: ?[]const u8 = null,
+    prompt: ?[]const u8 = null,
+    parallel: bool = false,
+    tasks: ?[]ManifestTask = null,
+};
+
+const ManifestDocument = struct {
+    core_prompt: ?[]const u8 = null,
+    directive: ?[]const u8 = null,
+    steps: []ManifestStep = &.{},
+};
+
+const ManifestTaskView = struct {
+    step_name: ?[]const u8,
+    task_name: ?[]const u8,
+    directive: []const u8,
+    prompt: ?[]const u8,
+};
+
+const ManifestTaskCollection = struct {
+    tasks: ManagedArrayList(ManifestTaskView),
+    names_to_free: ManagedArrayList([]u8),
+    parallel: bool,
+};
+
+const ParallelTaskContext = struct {
+    allocator: Allocator,
+    directive: []const u8,
+    cli_dir: ?[]const u8,
+    env_dir: ?[]const u8,
+    core_prompt: ?[]const u8,
+    step_prompt: ?[]const u8,
+    task_prompt: ?[]const u8,
+    label_step: ?[]const u8,
+    label_task: ?[]const u8,
+    response: ?[]u8,
+    err: ?anyerror = null,
 };
 
 fn runDirectiveValidation(
@@ -103,6 +151,300 @@ fn runDirectiveValidation(
     try std.fs.File.stdout().writeAll(summary);
 }
 
+fn executeManifest(
+    allocator: Allocator,
+    manifest_path: []const u8,
+    cli_dir: ?[]const u8,
+    env_dir: ?[]const u8,
+) !void {
+    const max_size: usize = 4 * 1024 * 1024;
+    const manifest_bytes = try std.fs.cwd().readFileAlloc(allocator, manifest_path, max_size);
+    defer allocator.free(manifest_bytes);
+
+    var parser = try ymlz.Ymlz(ManifestDocument).init(allocator);
+    const doc = parser.loadRaw(manifest_bytes) catch {
+        parser.deinit(ManifestDocument{ .steps = &.{} });
+        return error.InvalidDirective;
+    };
+    defer parser.deinit(doc);
+
+    if (doc.steps.len == 0) {
+        try std.fs.File.stderr().writeAll("pragma: manifest must define at least one step\n");
+        return error.InvalidDirective;
+    }
+
+    const stdout_file = std.fs.File.stdout();
+    const stderr_file = std.fs.File.stderr();
+
+    for (doc.steps, 0..) |step, step_index| {
+        const label = step.name orelse step.directive orelse doc.directive orelse "step";
+        const header = try std.fmt.allocPrint(allocator, "=== Step {d}: {s}\n", .{ step_index + 1, label });
+        defer allocator.free(header);
+        try stdout_file.writeAll(header);
+
+        var tasks_list = try collectManifestTasks(allocator, &doc, &step);
+        defer {
+            for (tasks_list.names_to_free.items) |name_copy| allocator.free(name_copy);
+            tasks_list.names_to_free.deinit();
+            tasks_list.tasks.deinit();
+        }
+
+        if (tasks_list.tasks.items.len == 0) {
+            try stderr_file.writeAll("pragma: manifest step produced no tasks\n");
+            return error.InvalidDirective;
+        }
+
+        if (tasks_list.parallel) {
+            try executeParallelTasks(
+                allocator,
+                &doc,
+                &step,
+                cli_dir,
+                env_dir,
+                &tasks_list.tasks,
+            );
+        } else {
+            for (tasks_list.tasks.items) |task_view| {
+                try executeSerialTask(
+                    allocator,
+                    &doc,
+                    &step,
+                    cli_dir,
+                    env_dir,
+                    task_view,
+                );
+            }
+        }
+    }
+}
+
+fn collectManifestTasks(
+    allocator: Allocator,
+    doc: *const ManifestDocument,
+    step: *const ManifestStep,
+) !ManifestTaskCollection {
+    var tasks = ManagedArrayList(ManifestTaskView).init(allocator);
+    var names = ManagedArrayList([]u8).init(allocator);
+    var parallel = step.parallel;
+
+    if (step.tasks) |task_list| {
+        if (step.parallel and task_list.len == 0) return error.InvalidDirective;
+        if (step.parallel and task_list.len <= 1) parallel = false;
+        for (task_list, 0..) |task, idx| {
+            const directive = task.directive orelse step.directive orelse doc.directive orelse return error.MissingDirective;
+            const name = task.name orelse step.name orelse directive;
+            const resolved_name: []const u8 = if (name.len == 0) blk: {
+                const generated = try std.fmt.allocPrint(allocator, "task-{d}", .{idx + 1});
+                try names.append(generated);
+                break :blk generated;
+            } else name;
+
+            try tasks.append(.{
+                .step_name = step.name,
+                .task_name = resolved_name,
+                .directive = directive,
+                .prompt = task.prompt,
+            });
+        }
+    } else {
+        const directive = step.directive orelse doc.directive orelse return error.MissingDirective;
+        const name = step.name orelse directive;
+        try tasks.append(.{
+            .step_name = step.name,
+            .task_name = name,
+            .directive = directive,
+            .prompt = step.prompt,
+        });
+        parallel = false;
+    }
+
+    return ManifestTaskCollection{
+        .tasks = tasks,
+        .names_to_free = names,
+        .parallel = parallel,
+    };
+}
+
+fn buildInlinePrompt(
+    allocator: Allocator,
+    segments: []const ?[]const u8,
+) !?[]u8 {
+    var buffer = ManagedArrayList(u8).init(allocator);
+    defer buffer.deinit();
+
+    var appended: bool = false;
+    for (segments) |segment_opt| {
+        if (segment_opt) |segment| {
+            const trimmed = std.mem.trim(u8, segment, " \r\n");
+            if (trimmed.len == 0) continue;
+            if (appended) {
+                try buffer.appendSlice("\n\n");
+            }
+            try buffer.appendSlice(trimmed);
+            appended = true;
+        }
+    }
+
+    if (!appended) return null;
+    return try buffer.toOwnedSlice();
+}
+
+fn executeSerialTask(
+    allocator: Allocator,
+    doc: *const ManifestDocument,
+    step: *const ManifestStep,
+    cli_dir: ?[]const u8,
+    env_dir: ?[]const u8,
+    task_view: ManifestTaskView,
+) !void {
+    var segments = [_]?[]const u8{ doc.core_prompt, step.prompt, task_view.prompt };
+    const extra = try buildInlinePrompt(allocator, &segments);
+    defer if (extra) |value| allocator.free(value);
+
+    const mut_extra = if (extra) |value| value else null;
+
+    const directive_doc = loadDirectiveDocument(
+        allocator,
+        task_view.directive,
+        cli_dir,
+        env_dir,
+        mut_extra,
+    ) catch |err| {
+        const label = task_view.task_name orelse task_view.directive;
+        const msg = try std.fmt.allocPrint(allocator, "pragma: step {s} failed to load directive ({s})\n", .{ label, @errorName(err) });
+        defer allocator.free(msg);
+        try std.fs.File.stderr().writeAll(msg);
+        return err;
+    };
+    defer allocator.free(directive_doc.prompt);
+    defer switch (directive_doc.contract) {
+        .custom => |value| allocator.free(value),
+        else => {},
+    };
+
+    const assembled = try assemblePrompt(allocator, directive_doc.prompt, directive_doc.contract);
+    defer allocator.free(assembled);
+
+    const response = runCodex(allocator, assembled) catch |err| {
+        const label = task_view.task_name orelse task_view.directive;
+        const msg = try std.fmt.allocPrint(allocator, "pragma: step {s} codex error ({s})\n", .{ label, @errorName(err) });
+        defer allocator.free(msg);
+        try std.fs.File.stderr().writeAll(msg);
+        return err;
+    };
+    defer allocator.free(response);
+
+    const label = task_view.task_name orelse task_view.directive;
+    const header = try std.fmt.allocPrint(allocator, "--- Task: {s} (directive: {s})\n", .{ label, task_view.directive });
+    defer allocator.free(header);
+    try std.fs.File.stdout().writeAll(header);
+    try std.fs.File.stdout().writeAll(response);
+    try std.fs.File.stdout().writeAll("\n");
+}
+
+fn executeParallelTasks(
+    allocator: Allocator,
+    doc: *const ManifestDocument,
+    step: *const ManifestStep,
+    cli_dir: ?[]const u8,
+    env_dir: ?[]const u8,
+    tasks: *ManagedArrayList(ManifestTaskView),
+) !void {
+    var contexts = ManagedArrayList(ParallelTaskContext).init(allocator);
+    defer contexts.deinit();
+
+    const thread_allocator: Allocator = std.heap.page_allocator;
+
+    for (tasks.items) |task_view| {
+        try contexts.append(.{
+            .allocator = thread_allocator,
+            .directive = task_view.directive,
+            .cli_dir = cli_dir,
+            .env_dir = env_dir,
+            .core_prompt = doc.core_prompt,
+            .step_prompt = step.prompt,
+            .task_prompt = task_view.prompt,
+            .label_step = step.name,
+            .label_task = task_view.task_name,
+            .response = null,
+            .err = null,
+        });
+    }
+
+    var threads = ManagedArrayList(std.Thread).init(allocator);
+    defer threads.deinit();
+
+    for (contexts.items) |*ctx| {
+        const thread = try std.Thread.spawn(.{}, manifestTaskThread, .{ctx});
+        try threads.append(thread);
+    }
+
+    for (threads.items) |thread| {
+        thread.join();
+    }
+
+    for (contexts.items) |*ctx| {
+        if (ctx.err) |err| {
+            const label = ctx.label_task orelse ctx.directive;
+            const msg = try std.fmt.allocPrint(allocator, "pragma: parallel task {s} failed ({s})\n", .{ label, @errorName(err) });
+            defer allocator.free(msg);
+            try std.fs.File.stderr().writeAll(msg);
+            return err;
+        }
+    }
+
+    for (contexts.items) |*ctx| {
+        const label = ctx.label_task orelse ctx.directive;
+        const header = try std.fmt.allocPrint(allocator, "--- Parallel Task: {s} (directive: {s})\n", .{ label, ctx.directive });
+        defer allocator.free(header);
+        try std.fs.File.stdout().writeAll(header);
+        if (ctx.response) |resp| {
+            defer ctx.allocator.free(resp);
+            try std.fs.File.stdout().writeAll(resp);
+        }
+        try std.fs.File.stdout().writeAll("\n");
+    }
+}
+
+fn manifestTaskThread(ctx: *ParallelTaskContext) void {
+    var segments = [_]?[]const u8{ ctx.core_prompt, ctx.step_prompt, ctx.task_prompt };
+    const extra = buildInlinePrompt(ctx.allocator, &segments) catch |err| {
+        ctx.err = err;
+        return;
+    };
+    defer if (extra) |value| ctx.allocator.free(value);
+
+    const mut_extra = if (extra) |value| value else null;
+
+    const directive_doc = loadDirectiveDocument(
+        ctx.allocator,
+        ctx.directive,
+        ctx.cli_dir,
+        ctx.env_dir,
+        mut_extra,
+    ) catch |err| {
+        ctx.err = err;
+        return;
+    };
+    defer ctx.allocator.free(directive_doc.prompt);
+    defer switch (directive_doc.contract) {
+        .custom => |value| ctx.allocator.free(value),
+        else => {},
+    };
+
+    const assembled = assemblePrompt(ctx.allocator, directive_doc.prompt, directive_doc.contract) catch |err| {
+        ctx.err = err;
+        return;
+    };
+    defer ctx.allocator.free(assembled);
+
+    const response = runCodex(ctx.allocator, assembled) catch |err| {
+        ctx.err = err;
+        return;
+    };
+    ctx.response = response;
+}
+
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
@@ -118,11 +460,16 @@ pub fn main() !void {
             try printUsage();
             return;
         },
+        error.MissingManifestValue => {
+            try printUsage();
+            return;
+        },
         else => return err,
     };
     defer if (invocation.directive) |value| allocator.free(value);
     defer if (invocation.directives_dir) |value| allocator.free(value);
     defer if (invocation.inline_prompt) |value| allocator.free(value);
+    defer if (invocation.manifest) |value| allocator.free(value);
 
     const env_directives_dir = std.process.getEnvVarOwned(allocator, "PRAGMA_DIRECTIVES_DIR") catch null;
     defer if (env_directives_dir) |value| allocator.free(value);
@@ -136,6 +483,15 @@ pub fn main() !void {
             error.ValidationFailed => return,
             else => return err,
         };
+        return;
+    }
+
+    if (invocation.manifest) |manifest_path| {
+        if (invocation.directive != null or invocation.inline_prompt != null) {
+            try std.fs.File.stderr().writeAll("pragma: --manifest cannot be combined with inline prompts or --directive\n");
+            return;
+        }
+        try executeManifest(allocator, manifest_path, invocation.directives_dir, env_directives_dir);
         return;
     }
 
@@ -191,7 +547,7 @@ pub fn main() !void {
 
 fn printUsage() !void {
     try std.fs.File.stderr().writeAll(
-        "usage: pragma [--validate-directives] [--directive NAME] [--directives-dir DIR] [--] \"<system prompt>\"\n",
+        "usage: pragma [--validate-directives] [--manifest FILE] [--directive NAME] [--directives-dir DIR] [--] \"<system prompt>\"\n",
     );
 }
 
@@ -207,6 +563,7 @@ fn parseCliInvocation(allocator: Allocator, args: *std.process.ArgIterator) !Cli
         .directives_dir = null,
         .inline_prompt = null,
         .validate_directives = false,
+        .manifest = null,
     };
 
     while (args.next()) |raw_arg| {
@@ -217,6 +574,19 @@ fn parseCliInvocation(allocator: Allocator, args: *std.process.ArgIterator) !Cli
             }
             if (std.mem.eql(u8, raw_arg, "--validate-directives")) {
                 invocation.validate_directives = true;
+                continue;
+            }
+            if (std.mem.eql(u8, raw_arg, "--manifest")) {
+                const value = args.next() orelse return error.MissingManifestValue;
+                if (invocation.manifest) |existing| allocator.free(existing);
+                invocation.manifest = try allocator.dupe(u8, value);
+                continue;
+            }
+            if (std.mem.startsWith(u8, raw_arg, "--manifest=")) {
+                const value = raw_arg["--manifest=".len..];
+                if (value.len == 0) return error.MissingManifestValue;
+                if (invocation.manifest) |existing| allocator.free(existing);
+                invocation.manifest = try allocator.dupe(u8, value);
                 continue;
             }
             if (std.mem.eql(u8, raw_arg, "--directive")) {
@@ -945,6 +1315,68 @@ test "validateDirectiveDir reports malformed files" {
     try std.testing.expect(stats.skipped == 1);
     try std.testing.expect(issues.items.len == 1);
     try std.testing.expect(std.mem.containsAtLeast(u8, issues.items[0].path, 1, "bad.md"));
+}
+
+test "executeManifest runs serial and parallel tasks" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makeDir("directives");
+    {
+        var file = try tmp.dir.createFile("directives/review.md", .{});
+        defer file.close();
+        try file.writeAll(
+            "---\n" ++
+                "output_contract: markdown\n" ++
+                "---\n" ++
+                "Respond concisely.\n",
+        );
+    }
+
+    const directives_path = try tmp.dir.realpathAlloc(allocator, "directives");
+    defer allocator.free(directives_path);
+
+    const manifest_content =
+        \\directive: review
+        \\core_prompt: |
+        \\  Shared context
+        \\steps:
+        \\  - name: Serial Review
+        \\    prompt: |
+        \\      Focus on the latest changes.
+        \\  - name: Parallel Checks
+        \\    parallel: true
+        \\    tasks:
+        \\      - name: Check A
+        \\        prompt: Look for syntax issues.
+        \\      - name: Check B
+        \\        prompt: Inspect documentation.
+    ;
+
+    {
+        var file = try tmp.dir.createFile("plan.yml", .{});
+        defer file.close();
+        try file.writeAll(manifest_content);
+    }
+    const manifest_path = try tmp.dir.realpathAlloc(allocator, "plan.yml");
+    defer allocator.free(manifest_path);
+
+    {
+        var file = try tmp.dir.createFile("codex-stub.sh", .{ .read = true, .mode = 0o755 });
+        defer file.close();
+        try file.writeAll(
+            "#!/bin/sh\n" ++ "cat <<'EOF'\n" ++ "{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"Stub Manifest OK\"}}\n" ++ "EOF\n",
+        );
+    }
+
+    const stub_path = try tmp.dir.realpathAlloc(allocator, "codex-stub.sh");
+    defer allocator.free(stub_path);
+
+    test_support.codex_override = stub_path;
+    defer test_support.codex_override = null;
+
+    try executeManifest(allocator, manifest_path, directives_path, null);
 }
 
 test "extractDirectiveContract defaults to markdown with untouched prompt" {
