@@ -1,10 +1,11 @@
 # pragma
 
-`pragma` is a lightweight Zig CLI that wraps `codex exec` so coding agents can run sub-agents without a larger toolchain. The tool accepts a single positional argument — the system prompt that should govern the sub-agent — and handles the rest:
+`pragma` is a lightweight Zig CLI that wraps `codex exec` so coding agents can run sub-agents without a larger toolchain. Feed it either a one-off system prompt or the name of a reusable directive file and it handles the rest:
 
 - Frames the call with a minimal sub-agent persona and reminds the model to ask for extra context when needed.
 - Invokes `codex exec --skip-git-repo-check --json -c 'mcp_servers={}'` (make sure `codex` is on your `$PATH`).
 - Streams the JSONL output, capturing the final `agent_message` item and emitting its markdown back to stdout.
+- Optionally loads Anthropic-style directive files (`---` YAML frontmatter + Markdown body) from `.pragma/directives/`, `directives/`, or a path you specify via CLI/env.
 
 ## Build
 
@@ -18,9 +19,12 @@ zig build
 ```bash
 # Single-turn invocation with a system prompt
 zig build run -- "Act as a focused CSS sub-agent. Return a markdown checklist."
+
+# Reuse a stored directive and append task-specific context
+zig build run -- --directive review -- "Concentrate on the latest database migration."
 ```
 
-If the sub-agent needs environment or repository details, include them in the system prompt you pass to `pragma` (or instruct the agent to request them explicitly).
+If the sub-agent needs environment or repository details, include them in the system prompt you pass to `pragma` (or instruct the agent to request them explicitly). When running by directive, any extra CLI text (after `--`) is appended after a blank line inside the directive body.
 
 - Override the default Markdown contract from inside the directive itself. Prepend metadata lines or blocks at the top of the prompt:
 
@@ -37,6 +41,31 @@ Operate as a release auditor.
 ```
 
 If both a format and a custom block are present, the block wins.
+
+### Directives
+
+Pragma understands the same directive structure Anthropic ships for Claude Code subagents: a Markdown file whose YAML frontmatter carries metadata.
+
+```markdown
+---
+name: review
+description: Structured code review with actionable diffs.
+output_contract: json
+---
+You are a code reviewer...
+```
+
+Place directive files in one of the following locations (first match wins):
+
+1. The path passed to `--directives-dir`.
+2. `$PRAGMA_DIRECTIVES_DIR`.
+3. `~/.pragma/directives/`.
+4. `.pragma/directives/` relative to the working directory.
+5. `directives/` relative to the working directory.
+
+You can also provide an absolute or relative file path directly via `--directive`, e.g. `--directive ./my/agents/security.md`.
+
+Frontmatter currently recognizes `output_contract`. Set it to `markdown`, `json`, or `plain`, or supply a multi-line block scalar to define a custom contract. Inline `pragma-output-format:` / `pragma-output-contract` markers embedded in the directive body continue to work and take precedence if present.
 
 ## Install via Homebrew Tap
 

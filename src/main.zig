@@ -4,6 +4,7 @@ const Allocator = std.mem.Allocator;
 const ManagedArrayList = std.array_list.Managed;
 const ArrayList = std.ArrayList;
 const builtin = @import("builtin");
+const ymlz = @import("ymlz");
 
 const test_support = struct {
     pub var codex_override: ?[]const u8 = null;
@@ -16,6 +17,23 @@ const OutputContract = union(enum) {
     custom: []const u8,
 };
 
+const DirectiveFrontmatter = struct {
+    name: ?[]const u8 = null,
+    description: ?[]const u8 = null,
+    output_contract: ?[]const u8 = null,
+};
+
+const CliInvocation = struct {
+    directive: ?[]u8,
+    directives_dir: ?[]u8,
+    inline_prompt: ?[]u8,
+};
+
+const DirectiveDocument = struct {
+    prompt: []u8,
+    contract: OutputContract,
+};
+
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
@@ -26,16 +44,53 @@ pub fn main() !void {
 
     _ = args.next();
 
-    const prompt_text = readPrompt(allocator, &args) catch |err| switch (err) {
-        error.MissingPrompt => {
+    var invocation = parseCliInvocation(allocator, &args) catch |err| switch (err) {
+        error.MissingDirectiveValue, error.MissingDirectivesDirValue, error.MissingDirectiveName, error.ShowUsage => {
             try printUsage();
             return;
         },
         else => return err,
     };
+    defer if (invocation.directive) |value| allocator.free(value);
+    defer if (invocation.directives_dir) |value| allocator.free(value);
+    defer if (invocation.inline_prompt) |value| allocator.free(value);
 
-    const extraction = try extractDirectiveContract(allocator, prompt_text);
-    allocator.free(prompt_text);
+    const env_directives_dir = std.process.getEnvVarOwned(allocator, "PRAGMA_DIRECTIVES_DIR") catch null;
+    defer if (env_directives_dir) |value| allocator.free(value);
+
+    var extraction: DirectiveDocument = undefined;
+    if (invocation.directive) |directive_name| {
+        const inline_extra: ?[]const u8 = if (invocation.inline_prompt) |value| value else null;
+        extraction = loadDirectiveDocument(
+            allocator,
+            directive_name,
+            invocation.directives_dir,
+            env_directives_dir,
+            inline_extra,
+        ) catch |err| switch (err) {
+            error.DirectiveNotFound => {
+                try std.fs.File.stderr().writeAll("pragma: directive not found\n");
+                return;
+            },
+            error.InvalidDirective => {
+                try std.fs.File.stderr().writeAll("pragma: directive is malformed\n");
+                return;
+            },
+            else => return err,
+        };
+        if (invocation.inline_prompt) |value| {
+            allocator.free(value);
+            invocation.inline_prompt = null;
+        }
+    } else {
+        const raw_prompt = invocation.inline_prompt orelse {
+            try printUsage();
+            return;
+        };
+        extraction = try extractDirectiveContract(allocator, raw_prompt);
+        allocator.free(raw_prompt);
+        invocation.inline_prompt = null;
+    }
     defer allocator.free(extraction.prompt);
     defer switch (extraction.contract) {
         .custom => |value| allocator.free(value),
@@ -55,21 +110,309 @@ pub fn main() !void {
 
 fn printUsage() !void {
     try std.fs.File.stderr().writeAll(
-        "usage: pragma \"<system prompt>\"\n",
+        "usage: pragma [--directive NAME] [--directives-dir DIR] [--] \"<system prompt>\"\n",
     );
 }
 
-fn readPrompt(allocator: Allocator, args: *std.process.ArgIterator) ![]u8 {
-    const first = args.next() orelse return error.MissingPrompt;
+fn parseCliInvocation(allocator: Allocator, args: *std.process.ArgIterator) !CliInvocation {
+    var directive: ?[]u8 = null;
+    var directives_dir: ?[]u8 = null;
+    var prompt_buffer = ManagedArrayList(u8).init(allocator);
+    defer prompt_buffer.deinit();
 
+    var reading_prompt = false;
+
+    while (args.next()) |raw_arg| {
+        if (!reading_prompt and raw_arg.len > 0 and raw_arg[0] == '-') {
+            if (std.mem.eql(u8, raw_arg, "--")) {
+                reading_prompt = true;
+                continue;
+            }
+            if (std.mem.eql(u8, raw_arg, "--directive")) {
+                const value = args.next() orelse return error.MissingDirectiveValue;
+                if (directive) |existing| allocator.free(existing);
+                directive = try allocator.dupe(u8, value);
+                continue;
+            }
+            if (std.mem.startsWith(u8, raw_arg, "--directive=")) {
+                const value = raw_arg["--directive=".len..];
+                if (value.len == 0) return error.MissingDirectiveName;
+                if (directive) |existing| allocator.free(existing);
+                directive = try allocator.dupe(u8, value);
+                continue;
+            }
+            if (std.mem.eql(u8, raw_arg, "--directives-dir")) {
+                const value = args.next() orelse return error.MissingDirectivesDirValue;
+                if (directives_dir) |existing| allocator.free(existing);
+                directives_dir = try allocator.dupe(u8, value);
+                continue;
+            }
+            if (std.mem.startsWith(u8, raw_arg, "--directives-dir=")) {
+                const value = raw_arg["--directives-dir=".len..];
+                if (value.len == 0) return error.MissingDirectivesDirValue;
+                if (directives_dir) |existing| allocator.free(existing);
+                directives_dir = try allocator.dupe(u8, value);
+                continue;
+            }
+            if (std.mem.eql(u8, raw_arg, "--help") or std.mem.eql(u8, raw_arg, "-h")) {
+                return error.ShowUsage;
+            }
+            reading_prompt = true;
+        }
+
+        if (reading_prompt and raw_arg.len == 0) continue;
+
+        if (prompt_buffer.items.len > 0) try prompt_buffer.append(' ');
+        try prompt_buffer.appendSlice(raw_arg);
+    }
+
+    const inline_prompt = if (prompt_buffer.items.len == 0)
+        null
+    else
+        try prompt_buffer.toOwnedSlice();
+
+    return .{
+        .directive = directive,
+        .directives_dir = directives_dir,
+        .inline_prompt = inline_prompt,
+    };
+}
+
+fn loadDirectiveDocument(
+    allocator: Allocator,
+    directive_name: []const u8,
+    cli_dir: ?[]const u8,
+    env_dir: ?[]const u8,
+    inline_extra: ?[]const u8,
+) !DirectiveDocument {
+    const path = try resolveDirectivePath(allocator, directive_name, cli_dir, env_dir);
+    defer allocator.free(path);
+
+    const max_size: usize = 4 * 1024 * 1024;
+    const content = try std.fs.cwd().readFileAlloc(allocator, path, max_size);
+    defer allocator.free(content);
+
+    const sections = try splitDirectiveDocument(content);
+
+    var contract_override: ?OutputContract = null;
+    defer if (contract_override) |override| {
+        switch (override) {
+            .custom => |value| allocator.free(value),
+            else => {},
+        }
+    };
+
+    if (sections.frontmatter) |frontmatter| {
+        contract_override = try parseDirectiveFrontmatter(allocator, frontmatter);
+    }
+
+    var prompt_input: []const u8 = sections.body;
+    var combined_owned: ?[]u8 = null;
+    defer if (combined_owned) |value| allocator.free(value);
+
+    if (inline_extra) |extra| {
+        if (extra.len > 0) {
+            combined_owned = try joinDirectiveAndInline(allocator, sections.body, extra);
+            prompt_input = combined_owned.?;
+        }
+    }
+
+    var extraction = try extractDirectiveContract(allocator, prompt_input);
+
+    if (contract_override) |override| {
+        setContract(&extraction.contract, allocator, override);
+        contract_override = null;
+    }
+
+    return .{
+        .prompt = extraction.prompt,
+        .contract = extraction.contract,
+    };
+}
+
+fn resolveDirectivePath(
+    allocator: Allocator,
+    directive_name: []const u8,
+    cli_dir: ?[]const u8,
+    env_dir: ?[]const u8,
+) ![]u8 {
+    if (looksLikePath(directive_name)) {
+        return resolveProvidedPath(allocator, directive_name);
+    }
+
+    if (cli_dir) |dir| {
+        if (try findDirectiveInDir(allocator, dir, directive_name)) |path| {
+            return path;
+        }
+    }
+
+    if (env_dir) |dir| {
+        if (try findDirectiveInDir(allocator, dir, directive_name)) |path| {
+            return path;
+        }
+    }
+
+    if (try findDirectiveInHome(allocator, directive_name)) |path| {
+        return path;
+    }
+
+    const defaults = [_][]const u8{
+        ".pragma/directives",
+        "directives",
+    };
+
+    for (defaults) |dir| {
+        if (try findDirectiveInDir(allocator, dir, directive_name)) |path| {
+            return path;
+        }
+    }
+
+    return error.DirectiveNotFound;
+}
+
+fn resolveProvidedPath(allocator: Allocator, raw: []const u8) ![]u8 {
+    std.fs.cwd().access(raw, .{}) catch |err| switch (err) {
+        error.FileNotFound => return error.DirectiveNotFound,
+        else => return err,
+    };
+    return allocator.dupe(u8, raw);
+}
+
+fn looksLikePath(identifier: []const u8) bool {
+    if (std.mem.indexOfScalar(u8, identifier, '/') != null) return true;
+    if (std.mem.indexOfScalar(u8, identifier, '\\') != null) return true;
+    if (std.mem.endsWith(u8, identifier, ".md")) return true;
+    if (std.mem.endsWith(u8, identifier, ".markdown")) return true;
+    return false;
+}
+
+fn findDirectiveInDir(
+    allocator: Allocator,
+    dir: []const u8,
+    name: []const u8,
+) !?[]u8 {
+    const exts = [_][]const u8{ ".md", ".markdown" };
+    for (exts) |ext| {
+        const file_name = try std.fmt.allocPrint(allocator, "{s}{s}", .{ name, ext });
+        defer allocator.free(file_name);
+
+        const candidate = try std.fs.path.join(allocator, &.{ dir, file_name });
+        defer allocator.free(candidate);
+
+        std.fs.cwd().access(candidate, .{}) catch |err| switch (err) {
+            error.FileNotFound => continue,
+            else => return err,
+        };
+
+        const copy = try allocator.dupe(u8, candidate);
+        return copy;
+    }
+
+    return null;
+}
+
+fn findDirectiveInHome(
+    allocator: Allocator,
+    name: []const u8,
+) !?[]u8 {
+    const home_opt = std.process.getEnvVarOwned(allocator, "HOME") catch null;
+    if (home_opt == null) return null;
+    const home = home_opt.?;
+    defer allocator.free(home);
+
+    const home_dir = try std.fs.path.join(allocator, &.{ home, ".pragma", "directives" });
+    defer allocator.free(home_dir);
+
+    return try findDirectiveInDir(allocator, home_dir, name);
+}
+
+fn splitDirectiveDocument(content: []const u8) !struct {
+    frontmatter: ?[]const u8,
+    body: []const u8,
+} {
+    if (!std.mem.startsWith(u8, content, "---")) {
+        return .{ .frontmatter = null, .body = content };
+    }
+
+    var cursor: usize = "---".len;
+    if (cursor >= content.len) return error.InvalidDirective;
+
+    if (content[cursor] == '\r') {
+        cursor += 1;
+    }
+    if (cursor >= content.len or content[cursor] != '\n') {
+        return error.InvalidDirective;
+    }
+    cursor += 1;
+    const meta_start = cursor;
+
+    while (cursor <= content.len) {
+        const line_end = std.mem.indexOfScalarPos(u8, content, cursor, '\n') orelse content.len;
+        var line = content[cursor..line_end];
+        line = trimTrailingCr(line);
+        const trimmed = std.mem.trim(u8, line, " \t");
+
+        if (std.mem.eql(u8, trimmed, "---")) {
+            const meta_slice = std.mem.trimRight(u8, content[meta_start..cursor], " \r\n");
+            const body_start = if (line_end == content.len) content.len else line_end + 1;
+            const body_slice = content[body_start..];
+            return .{ .frontmatter = meta_slice, .body = body_slice };
+        }
+
+        if (line_end == content.len) break;
+        cursor = line_end + 1;
+    }
+
+    return error.InvalidDirective;
+}
+
+fn parseDirectiveFrontmatter(allocator: Allocator, raw: []const u8) !?OutputContract {
+    var parser = try ymlz.Ymlz(DirectiveFrontmatter).init(allocator);
+    const metadata = parser.loadRaw(raw) catch {
+        return error.InvalidDirective;
+    };
+    defer parser.deinit(metadata);
+
+    if (metadata.output_contract) |value| {
+        const has_newline = std.mem.indexOfScalar(u8, value, '\n') != null;
+        const normalized = if (has_newline)
+            std.mem.trimRight(u8, value, " \r\n")
+        else
+            std.mem.trim(u8, value, " \t\r\n");
+        if (normalized.len == 0) return null;
+
+        if (parseOutputFormatValue(normalized)) |fmt| {
+            return fmt;
+        }
+
+        const copy = try allocator.dupe(u8, normalized);
+        return OutputContract{ .custom = copy };
+    }
+
+    return null;
+}
+
+fn joinDirectiveAndInline(
+    allocator: Allocator,
+    directive_body: []const u8,
+    inline_extra: []const u8,
+) ![]u8 {
     var buffer = ManagedArrayList(u8).init(allocator);
     defer buffer.deinit();
 
-    try buffer.appendSlice(first);
+    if (directive_body.len > 0) {
+        try buffer.appendSlice(directive_body);
+        if (directive_body.len >= 2 and std.mem.eql(u8, directive_body[directive_body.len - 2 ..], "\n\n")) {
+            // already has blank line suffix
+        } else if (directive_body[directive_body.len - 1] == '\n') {
+            try buffer.append('\n');
+        } else {
+            try buffer.appendSlice("\n\n");
+        }
+    }
 
-    while (args.next()) |segment| {
-        try buffer.append(' ');
-        try buffer.appendSlice(segment);
+    if (inline_extra.len > 0) {
+        try buffer.appendSlice(inline_extra);
     }
 
     return buffer.toOwnedSlice();
@@ -113,26 +456,16 @@ fn assemblePrompt(
             "\n" ++
             "### Directive Uplink\n" ++
             "<directive>\n{s}\n</directive>",
-        .{output_contract, system_prompt},
+        .{ output_contract, system_prompt },
     );
 }
 
 fn renderOutputContract(contract: OutputContract) []const u8 {
-    const markdown = "- Respond in Markdown using this skeleton:\n"
-        ++ "  - `## Result` — the finished deliverable (code blocks, diffs, specs, etc.).\n"
-        ++ "  - `## Verification` — evidence of checks performed or gaps still open.\n"
-        ++ "  - `## Assumptions` — bullet list of inferred context, if any.\n"
-        ++ "  - `## Next Steps` (optional) — only if meaningful follow-up remains.\n"
-        ++ "- Keep prose dense and unambiguous; avoid filler commentary.\n";
+    const markdown = "- Respond in Markdown using this skeleton:\n" ++ "  - `## Result` — the finished deliverable (code blocks, diffs, specs, etc.).\n" ++ "  - `## Verification` — evidence of checks performed or gaps still open.\n" ++ "  - `## Assumptions` — bullet list of inferred context, if any.\n" ++ "  - `## Next Steps` (optional) — only if meaningful follow-up remains.\n" ++ "- Keep prose dense and unambiguous; avoid filler commentary.\n";
 
-    const json = "- Respond with a single JSON object encoded as UTF-8.\n"
-        ++ "  - Include `result`, `verification`, and `assumptions` keys; each may contain nested structures as needed.\n"
-        ++ "  - Provide `next_steps` if meaningful actions remain, otherwise omit the field.\n"
-        ++ "- Do not emit any prose outside the JSON payload.\n";
+    const json = "- Respond with a single JSON object encoded as UTF-8.\n" ++ "  - Include `result`, `verification`, and `assumptions` keys; each may contain nested structures as needed.\n" ++ "  - Provide `next_steps` if meaningful actions remain, otherwise omit the field.\n" ++ "- Do not emit any prose outside the JSON payload.\n";
 
-    const plain = "- Respond as concise plain text paragraphs.\n"
-        ++ "- Cover results, validation evidence, assumptions, and next steps in distinct paragraphs separated by blank lines.\n"
-        ++ "- Avoid markdown syntax unless explicitly requested inside the directive.\n";
+    const plain = "- Respond as concise plain text paragraphs.\n" ++ "- Cover results, validation evidence, assumptions, and next steps in distinct paragraphs separated by blank lines.\n" ++ "- Avoid markdown syntax unless explicitly requested inside the directive.\n";
 
     return switch (contract) {
         .markdown => markdown,
@@ -142,10 +475,7 @@ fn renderOutputContract(contract: OutputContract) []const u8 {
     };
 }
 
-fn extractDirectiveContract(allocator: Allocator, raw_prompt: []const u8) !struct {
-    prompt: []u8,
-    contract: OutputContract,
-} {
+fn extractDirectiveContract(allocator: Allocator, raw_prompt: []const u8) !DirectiveDocument {
     var contract: OutputContract = .markdown;
     var kept_lines = ManagedArrayList([]const u8).init(allocator);
     defer kept_lines.deinit();
@@ -224,7 +554,7 @@ fn extractDirectiveContract(allocator: Allocator, raw_prompt: []const u8) !struc
     }
 
     const sanitized = try joinLines(allocator, kept_lines.items);
-    return .{
+    return DirectiveDocument{
         .prompt = sanitized,
         .contract = contract,
     };
@@ -272,6 +602,76 @@ fn setContract(contract_ptr: *OutputContract, allocator: Allocator, new_contract
         .json => OutputContract.json,
         .plain => OutputContract.plain,
     };
+}
+
+test "splitDirectiveDocument finds frontmatter and body" {
+    const doc =
+        \\---
+        \\output_contract: json
+        \\---
+        \\Do the thing.
+    ;
+    const sections = try splitDirectiveDocument(doc);
+    try std.testing.expect(sections.frontmatter != null);
+    try std.testing.expectEqualStrings("output_contract: json", sections.frontmatter.?);
+    try std.testing.expectEqualStrings("Do the thing.", std.mem.trim(u8, sections.body, " \r\n"));
+}
+
+test "parseDirectiveFrontmatter handles output contract" {
+    const allocator = std.testing.allocator;
+    const meta =
+        \\output_contract: plain
+    ;
+    const contract = try parseDirectiveFrontmatter(allocator, meta);
+    try std.testing.expect(contract != null);
+    try std.testing.expect(contract.? == .plain);
+}
+
+test "parseDirectiveFrontmatter handles custom block" {
+    const allocator = std.testing.allocator;
+    const meta =
+        \\output_contract: |
+        \\  Emit XML output.
+    ;
+    var contract = try parseDirectiveFrontmatter(allocator, meta);
+    defer if (contract) |*value| switch (value.*) {
+        .custom => |custom| allocator.free(custom),
+        else => {},
+    };
+    try std.testing.expect(contract != null);
+    try std.testing.expect(contract.? == .custom);
+    try std.testing.expectEqualStrings("Emit XML output.", contract.?.custom);
+}
+
+test "loadDirectiveDocument reads file and merges inline prompt" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makeDir("directives");
+    {
+        var file = try tmp.dir.createFile("directives/review.md", .{});
+        defer file.close();
+        try file.writeAll(
+            "---\n" ++ "output_contract: json\n" ++ "---\n" ++ "You are a reviewer.\n",
+        );
+    }
+
+    const directives_path = try tmp.dir.realpathAlloc(allocator, "directives");
+    defer allocator.free(directives_path);
+
+    const extra = "Assess the latest commit.";
+    const doc = try loadDirectiveDocument(allocator, "review", directives_path, null, extra);
+    defer allocator.free(doc.prompt);
+    defer switch (doc.contract) {
+        .custom => |value| allocator.free(value),
+        else => {},
+    };
+
+    try std.testing.expect(doc.contract == .json);
+    try std.testing.expect(std.mem.indexOfScalar(u8, doc.prompt, '\n') != null);
+    try std.testing.expect(std.mem.containsAtLeast(u8, doc.prompt, 1, "You are a reviewer."));
+    try std.testing.expect(std.mem.containsAtLeast(u8, doc.prompt, 1, extra));
 }
 
 test "extractDirectiveContract defaults to markdown with untouched prompt" {
@@ -385,10 +785,7 @@ test "runCodex honors PRAGMA_CODEX_BIN stub" {
         var file = try tmp.dir.createFile(script_name, .{ .read = true, .mode = 0o755 });
         defer file.close();
         try file.writeAll(
-            "#!/bin/sh\n"
-            ++ "cat <<'EOF'\n"
-            ++ "{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"Stub OK\"}}\n"
-            ++ "EOF\n",
+            "#!/bin/sh\n" ++ "cat <<'EOF'\n" ++ "{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"Stub OK\"}}\n" ++ "EOF\n",
         );
     }
 
