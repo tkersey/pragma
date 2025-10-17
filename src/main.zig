@@ -507,8 +507,9 @@ test "executeManifest runs serial and parallel tasks" {
 
 test "executeManifest runs serial and parallel tasks (real codex)" {
     const allocator = std.testing.allocator;
-    const use_real_codex = std.process.hasEnvVar(allocator, "PRAGMA_TEST_REAL_CODEX") catch false;
-    if (!use_real_codex) return;
+    const real_env = std.process.getEnvVarOwned(allocator, "PRAGMA_TEST_REAL_CODEX") catch null;
+    defer if (real_env) |value| allocator.free(value);
+    if (real_env == null) return;
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();

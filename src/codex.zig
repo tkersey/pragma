@@ -227,8 +227,21 @@ pub fn runCodex(allocator: Allocator, run_ctx: *RunContext, label: []const u8, p
         defer allocator.free(env);
         break :blk parseBufferLimit(env, 10 * 1024 * 1024);
     };
+    const timeout_ms = blk: {
+        const env = std.process.getEnvVarOwned(allocator, "PRAGMA_CODEX_TIMEOUT_MS") catch break :blk 120_000;
+        defer allocator.free(env);
+        break :blk parseBufferLimit(env, 120_000);
+    };
+    const timeout_ns: ?u64 = if (timeout_ms == 0) null else timeout_ms * std.time.ns_per_ms;
 
-    const output = try collectChildOutput(allocator, &process, max_stdout, max_stderr);
+    const output = collectChildOutput(allocator, &process, max_stdout, max_stderr, timeout_ns) catch |err| switch (err) {
+        error.ExecutionTimedOut => {
+            _ = process.kill() catch {};
+            _ = process.wait() catch {};
+            return error.CodexTimeout;
+        },
+        else => return err,
+    };
     defer allocator.free(output.stdout);
     defer allocator.free(output.stderr);
 
@@ -441,6 +454,7 @@ fn collectChildOutput(
     child: *std.process.Child,
     max_stdout: usize,
     max_stderr: usize,
+    timeout_ns: ?u64,
 ) !struct {
     stdout: []u8,
     stderr: []u8,
@@ -461,6 +475,8 @@ fn collectChildOutput(
     });
     defer poller.deinit();
 
+    var timer = std.time.Timer.start() catch unreachable;
+
     const stdout_reader = poller.reader(.stdout);
     stdout_reader.buffer = stdout_list.allocatedSlice();
     stdout_reader.seek = 0;
@@ -471,7 +487,20 @@ fn collectChildOutput(
     stderr_reader.seek = 0;
     stderr_reader.end = stderr_list.items.len;
 
-    while (try poller.poll()) {
+    while (true) {
+        const wait_ns: ?u64 = if (timeout_ns) |limit| blk: {
+            const elapsed = timer.read();
+            if (elapsed >= limit) return error.ExecutionTimedOut;
+            break :blk limit - elapsed;
+        } else null;
+
+        const ready = if (wait_ns) |ns|
+            try poller.pollTimeout(ns)
+        else
+            try poller.poll();
+
+        if (!ready) break;
+
         if (stdout_reader.bufferedLen() > max_stdout) return error.StdoutStreamTooLong;
         if (stderr_reader.bufferedLen() > max_stderr) return error.StderrStreamTooLong;
     }
