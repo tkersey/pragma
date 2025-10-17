@@ -505,6 +505,84 @@ test "executeManifest runs serial and parallel tasks" {
     );
 }
 
+test "executeManifest runs serial and parallel tasks (real codex)" {
+    const allocator = std.testing.allocator;
+    const use_real_codex = std.process.hasEnvVar(allocator, "PRAGMA_TEST_REAL_CODEX") catch false;
+    if (!use_real_codex) return;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makeDir("directives");
+    {
+        var file = try tmp.dir.createFile("directives/review.md", .{});
+        defer file.close();
+        try file.writeAll(
+            "---\n" ++
+                "output_contract: markdown\n" ++
+                "---\n" ++
+                "Respond concisely.\n",
+        );
+    }
+
+    const directives_path = try tmp.dir.realpathAlloc(allocator, "directives");
+    defer allocator.free(directives_path);
+
+    const manifest_content =
+        \\{
+        \\  "directive": "review",
+        \\  "core_prompt": "Shared context",
+        \\  "steps": [
+        \\    {
+        \\      "name": "Serial Review",
+        \\      "prompt": "Focus on the latest changes."
+        \\    },
+        \\    {
+        \\      "name": "Parallel Checks",
+        \\      "parallel": true,
+        \\      "tasks": [
+        \\        {
+        \\          "name": "Check A",
+        \\          "prompt": "Look for syntax issues."
+        \\        },
+        \\        {
+        \\          "name": "Check B",
+        \\          "prompt": "Inspect documentation."
+        \\        }
+        \\      ]
+        \\    }
+        \\  ]
+        \\}
+    ;
+
+    {
+        var file = try tmp.dir.createFile("plan.json", .{});
+        defer file.close();
+        try file.writeAll(manifest_content);
+    }
+    const manifest_path = try tmp.dir.realpathAlloc(allocator, "plan.json");
+    defer allocator.free(manifest_path);
+
+    var run_ctx = try RunContext.init(allocator, false);
+    defer run_ctx.deinit(allocator);
+
+    const deps = manifest.Dependencies(RunContext){
+        .loadDirectiveDocument = loadDirectiveDocument,
+        .assemblePrompt = assemblePrompt,
+        .runCodex = runCodex,
+        .executeParallel = executeParallelTasks,
+    };
+    try manifest.executeManifest(
+        RunContext,
+        allocator,
+        manifest_path,
+        directives_path,
+        null,
+        &run_ctx,
+        deps,
+    );
+}
+
 test "assemblePrompt injects json contract instructions" {
     const allocator = std.testing.allocator;
     const prompt = "Do something";
