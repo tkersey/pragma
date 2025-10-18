@@ -413,6 +413,38 @@ fn printUsage() !void {
     );
 }
 
+/// Helper to parse flag that takes a string value (supports both --flag value and --flag=value syntax)
+fn parseStringFlag(
+    allocator: Allocator,
+    raw_arg: []const u8,
+    flag_name: []const u8,
+    args: *std.process.ArgIterator,
+    target: *?[]u8,
+    missing_error: anyerror,
+) !bool {
+    const eq_prefix = std.fmt.allocPrint(allocator, "--{s}=", .{flag_name}) catch return false;
+    defer allocator.free(eq_prefix);
+    const space_prefix = std.fmt.allocPrint(allocator, "--{s}", .{flag_name}) catch return false;
+    defer allocator.free(space_prefix);
+
+    if (std.mem.startsWith(u8, raw_arg, eq_prefix)) {
+        const value = raw_arg[eq_prefix.len..];
+        if (value.len == 0) return missing_error;
+        if (target.*) |existing| allocator.free(existing);
+        target.* = try allocator.dupe(u8, value);
+        return true;
+    }
+
+    if (std.mem.eql(u8, raw_arg, space_prefix)) {
+        const value = args.next() orelse return missing_error;
+        if (target.*) |existing| allocator.free(existing);
+        target.* = try allocator.dupe(u8, value);
+        return true;
+    }
+
+    return false;
+}
+
 fn parseCliInvocation(allocator: Allocator, args: *std.process.ArgIterator) !CliInvocation {
     var directive: ?[]u8 = null;
     var directives_dir: ?[]u8 = null;
@@ -431,10 +463,13 @@ fn parseCliInvocation(allocator: Allocator, args: *std.process.ArgIterator) !Cli
 
     while (args.next()) |raw_arg| {
         if (!reading_prompt and raw_arg.len > 0 and raw_arg[0] == '-') {
+            // Simple delimiter to start reading prompt
             if (std.mem.eql(u8, raw_arg, "--")) {
                 reading_prompt = true;
                 continue;
             }
+
+            // Boolean flags
             if (std.mem.eql(u8, raw_arg, "--validate-directives")) {
                 invocation.validate_directives = true;
                 continue;
@@ -443,48 +478,16 @@ fn parseCliInvocation(allocator: Allocator, args: *std.process.ArgIterator) !Cli
                 invocation.keep_run_artifacts = true;
                 continue;
             }
-            if (std.mem.eql(u8, raw_arg, "--manifest")) {
-                const value = args.next() orelse return error.MissingManifestValue;
-                if (invocation.manifest) |existing| allocator.free(existing);
-                invocation.manifest = try allocator.dupe(u8, value);
-                continue;
-            }
-            if (std.mem.startsWith(u8, raw_arg, "--manifest=")) {
-                const value = raw_arg["--manifest=".len..];
-                if (value.len == 0) return error.MissingManifestValue;
-                if (invocation.manifest) |existing| allocator.free(existing);
-                invocation.manifest = try allocator.dupe(u8, value);
-                continue;
-            }
-            if (std.mem.eql(u8, raw_arg, "--directive")) {
-                const value = args.next() orelse return error.MissingDirectiveValue;
-                if (directive) |existing| allocator.free(existing);
-                directive = try allocator.dupe(u8, value);
-                continue;
-            }
-            if (std.mem.startsWith(u8, raw_arg, "--directive=")) {
-                const value = raw_arg["--directive=".len..];
-                if (value.len == 0) return error.MissingDirectiveName;
-                if (directive) |existing| allocator.free(existing);
-                directive = try allocator.dupe(u8, value);
-                continue;
-            }
-            if (std.mem.eql(u8, raw_arg, "--directives-dir")) {
-                const value = args.next() orelse return error.MissingDirectivesDirValue;
-                if (directives_dir) |existing| allocator.free(existing);
-                directives_dir = try allocator.dupe(u8, value);
-                continue;
-            }
-            if (std.mem.startsWith(u8, raw_arg, "--directives-dir=")) {
-                const value = raw_arg["--directives-dir=".len..];
-                if (value.len == 0) return error.MissingDirectivesDirValue;
-                if (directives_dir) |existing| allocator.free(existing);
-                directives_dir = try allocator.dupe(u8, value);
-                continue;
-            }
             if (std.mem.eql(u8, raw_arg, "--help") or std.mem.eql(u8, raw_arg, "-h")) {
                 return error.ShowUsage;
             }
+
+            // String value flags (handles both --flag value and --flag=value)
+            if (try parseStringFlag(allocator, raw_arg, "manifest", args, &invocation.manifest, error.MissingManifestValue)) continue;
+            if (try parseStringFlag(allocator, raw_arg, "directive", args, &directive, error.MissingDirectiveValue)) continue;
+            if (try parseStringFlag(allocator, raw_arg, "directives-dir", args, &directives_dir, error.MissingDirectivesDirValue)) continue;
+
+            // Unknown flag - treat as start of prompt
             reading_prompt = true;
         }
 
@@ -502,6 +505,17 @@ fn parseCliInvocation(allocator: Allocator, args: *std.process.ArgIterator) !Cli
     return invocation;
 }
 
+/// Assemble the complete sub-agent prompt with field manual and output contract.
+///
+/// Takes a user-provided system prompt (directive) and wraps it in the Pragma
+/// Sub-Agent Field Manual that provides:
+/// - Orientation guidelines for understanding the task
+/// - Execution workflow (plan → execute → validate)
+/// - Collaboration and tooling best practices
+/// - Output contract matching the specified format
+/// - Quality and safety gates
+///
+/// The assembled prompt enforces consistent sub-agent behavior across all invocations.
 pub fn assemblePrompt(
     allocator: Allocator,
     system_prompt: []const u8,

@@ -66,6 +66,11 @@ pub fn loadDirectiveDocument(
     }
 
     var extraction = try extractDirectiveContract(allocator, prompt_input);
+    errdefer allocator.free(extraction.prompt);
+    errdefer switch (extraction.contract) {
+        .custom => |value| allocator.free(value),
+        else => {},
+    };
 
     if (contract_override) |override| {
         setContract(&extraction.contract, allocator, override);
@@ -185,6 +190,17 @@ pub fn validateDirectiveDir(
     }
 }
 
+/// Parse and extract output contract directives from raw prompt text.
+///
+/// Recognizes two directive formats:
+/// 1. Inline: `pragma-output-format: json|markdown|plain`
+/// 2. Block: `<<<pragma-output-contract` ... `pragma-output-contract>>>`
+/// 3. Inline custom: `pragma-output-contract: <custom text>`
+///
+/// All recognized directives are removed from the returned prompt.
+/// Unclosed block directives are left in the prompt text.
+///
+/// Returns a DirectiveDocument containing the sanitized prompt and parsed contract.
 pub fn extractDirectiveContract(allocator: Allocator, raw_prompt: []const u8) !DirectiveDocument {
     var contract: OutputContract = .markdown;
     var kept_lines = ManagedArrayList([]const u8).init(allocator);
@@ -437,6 +453,17 @@ fn splitDirectiveDocument(content: []const u8) !struct {
     return error.InvalidDirective;
 }
 
+/// Parse YAML frontmatter for the `output_contract` key.
+///
+/// Supports three value formats:
+/// 1. Simple: `output_contract: json` → returns OutputContract.json
+/// 2. Quoted: `output_contract: "markdown"` → returns OutputContract.markdown
+/// 3. Block scalar: `output_contract: |` → returns OutputContract.custom with multi-line text
+///
+/// Block scalars use YAML's `|` or `>` syntax where subsequent indented lines
+/// form the contract text until a non-indented line or end of input.
+///
+/// Returns null if no `output_contract` key found.
 fn parseDirectiveFrontmatter(allocator: Allocator, raw: []const u8) !?OutputContract {
     var lines = std.ArrayList([]const u8).empty;
     defer lines.deinit(allocator);
