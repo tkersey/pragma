@@ -27,10 +27,11 @@ pub const RunContext = struct {
     run_path: ?[]u8 = null,
     counter: usize = 0,
     prune_done: bool = false,
+    suppress_notices: bool = false,
 
     pub fn init(allocator: Allocator, keep_artifacts: bool) !RunContext {
-        const stdout_limit = parseSizeEnv(allocator, "PRAGMA_SPILL_STDOUT", 1024 * 1024);
-        const stderr_limit = parseSizeEnv(allocator, "PRAGMA_SPILL_STDERR", 512 * 1024);
+        const stdout_limit = parseSizeEnv(allocator, "PRAGMA_SPILL_STDOUT", 64 * 1024);
+        const stderr_limit = parseSizeEnv(allocator, "PRAGMA_SPILL_STDERR", 16 * 1024);
         const retain_limit = parseSizeEnv(allocator, "PRAGMA_RUN_HISTORY", 20);
         const root = try resolveArtifactsRoot(allocator);
         errdefer allocator.free(root);
@@ -133,21 +134,27 @@ pub const RunContext = struct {
             .{ label, human, path },
         );
         defer allocator.free(message);
-        try std.fs.File.stderr().writeAll(message);
+        if (!self.suppress_notices) {
+            try std.fs.File.stderr().writeAll(message);
+        }
     }
 
     pub fn handleStderr(self: *RunContext, allocator: Allocator, label: []const u8, content: []const u8) !void {
         if (content.len == 0) return;
         if (self.spill_stderr_limit == 0 or content.len <= self.spill_stderr_limit) {
-            try std.fs.File.stderr().writeAll(content);
+            if (!self.suppress_notices) {
+                try std.fs.File.stderr().writeAll(content);
+            }
             return;
         }
 
         const preview_len = @min(self.preview_limit, content.len);
         if (preview_len > 0) {
-            try std.fs.File.stderr().writeAll(content[0..preview_len]);
-            if (content[preview_len - 1] != '\n') {
-                try std.fs.File.stderr().writeAll("\n");
+            if (!self.suppress_notices) {
+                try std.fs.File.stderr().writeAll(content[0..preview_len]);
+                if (content[preview_len - 1] != '\n') {
+                    try std.fs.File.stderr().writeAll("\n");
+                }
             }
         }
 
@@ -163,7 +170,9 @@ pub const RunContext = struct {
             .{ label, preview_len, human, path },
         );
         defer allocator.free(notice);
-        try std.fs.File.stderr().writeAll(notice);
+        if (!self.suppress_notices) {
+            try std.fs.File.stderr().writeAll(notice);
+        }
     }
 };
 
@@ -668,6 +677,7 @@ test "RunContext spills stdout to disk when over limit" {
         ctx.force_keep = false;
         ctx.deinit(allocator);
     }
+    ctx.suppress_notices = true;
 
     ctx.spill_stdout_limit = 32;
     ctx.preview_limit = 0;
@@ -705,6 +715,7 @@ test "RunContext spills stderr to disk when over limit" {
         ctx.force_keep = false;
         ctx.deinit(allocator);
     }
+    ctx.suppress_notices = true;
 
     ctx.spill_stderr_limit = 16;
     ctx.preview_limit = 0;

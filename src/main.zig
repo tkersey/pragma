@@ -12,7 +12,6 @@ const parallel_module = if (builtin.os.tag == .windows)
 else
     @import("parallel_posix.zig");
 
-const test_support = codex.test_support;
 const OutputContract = directives.OutputContract;
 const DirectiveDocument = directives.DirectiveDocument;
 const ValidationIssue = directives.ValidationIssue;
@@ -136,8 +135,153 @@ fn executeParallelTasks(
     cli_dir: ?[]const u8,
     env_dir: ?[]const u8,
     tasks: *ManagedArrayList(ManifestTaskView),
+    stdout_writer: manifest.OutputWriter,
+    stderr_writer: manifest.OutputWriter,
 ) !void {
-    return parallel_module.executeParallelTasks(allocator, &parallel_helpers, run_ctx, doc, step, cli_dir, env_dir, tasks);
+    const disable_parallel = builtin.is_test or parseBoolEnv(allocator, "PRAGMA_DISABLE_PARALLEL", false);
+    if (disable_parallel) {
+        return runTasksSequential(allocator, &parallel_helpers, run_ctx, doc, step, cli_dir, env_dir, tasks, stdout_writer, stderr_writer);
+    }
+    return parallel_module.executeParallelTasks(allocator, &parallel_helpers, run_ctx, doc, step, cli_dir, env_dir, tasks, stdout_writer, stderr_writer);
+}
+
+fn runTasksSequential(
+    allocator: Allocator,
+    helpers_ptr: anytype,
+    run_ctx: anytype,
+    doc: *const ManifestDocument,
+    step: *const ManifestStep,
+    cli_dir: ?[]const u8,
+    env_dir: ?[]const u8,
+    tasks: *ManagedArrayList(ManifestTaskView),
+    stdout_writer: manifest.OutputWriter,
+    stderr_writer: manifest.OutputWriter,
+) !void {
+    const helpers = helpers_ptr.*;
+    for (tasks.items) |task_view| {
+        var segments = [_]?[]const u8{ doc.core_prompt, step.prompt, task_view.prompt };
+        const extra = try helpers.buildInlinePrompt(allocator, &segments);
+        defer if (extra) |value| allocator.free(value);
+        const mut_extra = if (extra) |value| value else null;
+
+        var directive_doc = helpers.loadDirectiveDocument(
+            allocator,
+            task_view.directive,
+            cli_dir,
+            env_dir,
+            mut_extra,
+        ) catch |err| {
+            const label = task_view.task_name orelse task_view.directive;
+            const msg = try std.fmt.allocPrint(allocator, "pragma: step {s} failed to load directive ({s})\n", .{ label, @errorName(err) });
+            defer allocator.free(msg);
+            try stderr_writer.writeAll(msg);
+            return err;
+        };
+        defer allocator.free(directive_doc.prompt);
+        defer switch (directive_doc.contract) {
+            .custom => |value| allocator.free(value),
+            else => {},
+        };
+
+        const assembled = try helpers.assemblePrompt(allocator, directive_doc.prompt, directive_doc.contract);
+        defer allocator.free(assembled);
+
+        const label = task_view.task_name orelse task_view.directive;
+
+        const response = helpers.runCodex(allocator, run_ctx, label, assembled) catch |err| {
+            const msg = try std.fmt.allocPrint(allocator, "pragma: step {s} codex error ({s})\n", .{ label, @errorName(err) });
+            defer allocator.free(msg);
+            try stderr_writer.writeAll(msg);
+            return err;
+        };
+        defer allocator.free(response);
+
+        const message = helpers.extractAgentMarkdown(allocator, response) catch |err| {
+            const msg = try std.fmt.allocPrint(allocator, "pragma: step {s} output parse error ({s})\n", .{ label, @errorName(err) });
+            defer allocator.free(msg);
+            try stderr_writer.writeAll(msg);
+            return err;
+        };
+        defer allocator.free(message);
+
+        const header = try std.fmt.allocPrint(allocator, "--- Task: {s} (directive: {s})\n", .{ label, task_view.directive });
+        defer allocator.free(header);
+        try stdout_writer.writeAll(header);
+        try stdout_writer.writeAll(message);
+        try stdout_writer.writeAll("\n");
+    }
+}
+
+fn testRunCodexStub(
+    allocator: Allocator,
+    run_ctx: *TestRunContext,
+    label: []const u8,
+    prompt: []const u8,
+) ![]u8 {
+    _ = prompt;
+
+    const stub = "{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"Stub Manifest OK\"}}\n";
+    try run_ctx.handleStdout(allocator, label, stub);
+    return allocator.dupe(u8, "Stub Manifest OK");
+}
+
+fn testLoadDirectiveStub(
+    allocator: Allocator,
+    directive_name: []const u8,
+    cli_dir: ?[]const u8,
+    env_dir: ?[]const u8,
+    inline_extra: ?[]const u8,
+) !DirectiveDocument {
+    _ = cli_dir;
+    _ = env_dir;
+    _ = inline_extra;
+
+    const prompt = try std.fmt.allocPrint(allocator, "Directive {s}", .{directive_name});
+    errdefer allocator.free(prompt);
+
+    return DirectiveDocument{
+        .prompt = prompt,
+        .contract = OutputContract.markdown,
+    };
+}
+
+fn testAssemblePromptStub(
+    allocator: Allocator,
+    prompt: []const u8,
+    contract: OutputContract,
+) ![]u8 {
+    _ = contract;
+    return allocator.dupe(u8, prompt);
+}
+
+fn testExecuteParallelStub(
+    allocator: Allocator,
+    run_ctx: *TestRunContext,
+    doc: *const ManifestDocument,
+    step: *const ManifestStep,
+    cli_dir: ?[]const u8,
+    env_dir: ?[]const u8,
+    tasks: *ManagedArrayList(ManifestTaskView),
+    stdout_writer: manifest.OutputWriter,
+    stderr_writer: manifest.OutputWriter,
+) !void {
+    const Helpers = struct {
+        buildInlinePrompt: *const fn (Allocator, []const ?[]const u8) anyerror!?[]u8,
+        loadDirectiveDocument: *const fn (Allocator, []const u8, ?[]const u8, ?[]const u8, ?[]const u8) anyerror!DirectiveDocument,
+        assemblePrompt: *const fn (Allocator, []const u8, OutputContract) anyerror![]u8,
+        runCodex: *const fn (Allocator, *TestRunContext, []const u8, []const u8) anyerror![]u8,
+        extractAgentMarkdown: *const fn (Allocator, []const u8) anyerror![]u8,
+    };
+
+    var helpers = Helpers{
+        .buildInlinePrompt = manifest.buildInlinePrompt,
+        .loadDirectiveDocument = testLoadDirectiveStub,
+        .assemblePrompt = testAssemblePromptStub,
+        .runCodex = testRunCodexStub,
+        .extractAgentMarkdown = extractAgentMarkdown,
+    };
+
+    try runTasksSequential(allocator, &helpers, run_ctx, doc, step, cli_dir, env_dir, tasks, stdout_writer, stderr_writer);
 }
 
 pub fn main() !void {
@@ -415,26 +559,61 @@ fn renderOutputContract(contract: OutputContract) []const u8 {
     };
 }
 
+const TestLogEntry = struct {
+    label: []u8,
+    content: []u8,
+};
+
+const TestRunContext = struct {
+    allocator: Allocator,
+    stdout_entries: ManagedArrayList(TestLogEntry),
+    stderr_entries: ManagedArrayList(TestLogEntry),
+
+    fn init(allocator: Allocator) TestRunContext {
+        return .{
+            .allocator = allocator,
+            .stdout_entries = ManagedArrayList(TestLogEntry).init(allocator),
+            .stderr_entries = ManagedArrayList(TestLogEntry).init(allocator),
+        };
+    }
+
+    fn deinit(self: *TestRunContext) void {
+        const allocator = self.allocator;
+        for (self.stdout_entries.items) |entry| {
+            allocator.free(entry.label);
+            allocator.free(entry.content);
+        }
+        self.stdout_entries.deinit();
+
+        for (self.stderr_entries.items) |entry| {
+            allocator.free(entry.label);
+            allocator.free(entry.content);
+        }
+        self.stderr_entries.deinit();
+    }
+
+    pub fn handleStdout(self: *TestRunContext, allocator: Allocator, label: []const u8, content: []const u8) !void {
+        const label_copy = try allocator.dupe(u8, label);
+        errdefer allocator.free(label_copy);
+        const content_copy = try allocator.dupe(u8, content);
+        errdefer allocator.free(content_copy);
+        try self.stdout_entries.append(.{ .label = label_copy, .content = content_copy });
+    }
+
+    pub fn handleStderr(self: *TestRunContext, allocator: Allocator, label: []const u8, content: []const u8) !void {
+        const label_copy = try allocator.dupe(u8, label);
+        errdefer allocator.free(label_copy);
+        const content_copy = try allocator.dupe(u8, content);
+        errdefer allocator.free(content_copy);
+        try self.stderr_entries.append(.{ .label = label_copy, .content = content_copy });
+    }
+};
+
 test "executeManifest runs serial and parallel tasks" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    try tmp.dir.makeDir("directives");
-    {
-        var file = try tmp.dir.createFile("directives/review.md", .{});
-        defer file.close();
-        try file.writeAll(
-            "---\n" ++
-                "output_contract: markdown\n" ++
-                "---\n" ++
-                "Respond concisely.\n",
-        );
-    }
-
-    const directives_path = try tmp.dir.realpathAlloc(allocator, "directives");
-    defer allocator.free(directives_path);
-
     const manifest_content =
         \\{
         \\  "directive": "review",
@@ -470,46 +649,86 @@ test "executeManifest runs serial and parallel tasks" {
     const manifest_path = try tmp.dir.realpathAlloc(allocator, "plan.json");
     defer allocator.free(manifest_path);
 
-    const use_real_codex = std.process.hasEnvVar(allocator, "PRAGMA_TEST_REAL_CODEX") catch false;
-    if (!use_real_codex) {
-        var file = try tmp.dir.createFile("codex-stub.sh", .{ .read = true, .mode = 0o755 });
-        defer file.close();
-        try file.writeAll(
-            "#!/bin/sh\n" ++ "cat <<'EOF'\n" ++ "{\"type\":\"item.completed\",\"item\":{\"type\":\"agent_message\",\"text\":\"Stub Manifest OK\"}}\n" ++ "EOF\n",
-        );
+    var run_ctx = TestRunContext.init(allocator);
+    defer run_ctx.deinit();
 
-        const stub_path = try tmp.dir.realpathAlloc(allocator, "codex-stub.sh");
-        defer allocator.free(stub_path);
+    const StubDeps = struct {
+        fn run(test_allocator: Allocator, ctx: *TestRunContext, label: []const u8, prompt: []const u8) ![]u8 {
+            return testRunCodexStub(test_allocator, ctx, label, prompt);
+        }
 
-        test_support.codex_override = stub_path;
-        defer test_support.codex_override = null;
-    }
-
-    var run_ctx = try RunContext.init(allocator, false);
-    defer run_ctx.deinit(allocator);
-
-    const deps = manifest.Dependencies(RunContext){
-        .loadDirectiveDocument = loadDirectiveDocument,
-        .assemblePrompt = assemblePrompt,
-        .runCodex = runCodex,
-        .executeParallel = executeParallelTasks,
+        fn parallel(
+            test_allocator: Allocator,
+            ctx: *TestRunContext,
+            doc: *const ManifestDocument,
+            step: *const ManifestStep,
+            cli_dir: ?[]const u8,
+            env_dir: ?[]const u8,
+            tasks: *ManagedArrayList(ManifestTaskView),
+            stdout_writer: manifest.OutputWriter,
+            stderr_writer: manifest.OutputWriter,
+        ) !void {
+            return testExecuteParallelStub(test_allocator, ctx, doc, step, cli_dir, env_dir, tasks, stdout_writer, stderr_writer);
+        }
     };
-    try manifest.executeManifest(
-        RunContext,
+
+    const deps = manifest.Dependencies(TestRunContext){
+        .loadDirectiveDocument = testLoadDirectiveStub,
+        .assemblePrompt = testAssemblePromptStub,
+        .runCodex = StubDeps.run,
+        .executeParallel = StubDeps.parallel,
+    };
+    const stdout_writer = manifest.nullOutputWriter();
+    const stderr_writer = manifest.nullOutputWriter();
+
+    try manifest.executeManifestWithWriters(
+        TestRunContext,
         allocator,
         manifest_path,
-        directives_path,
+        null,
         null,
         &run_ctx,
         deps,
+        stdout_writer,
+        stderr_writer,
     );
+
+    try std.testing.expectEqual(@as(usize, 3), run_ctx.stdout_entries.items.len);
+    try std.testing.expectEqualStrings("Serial Review", run_ctx.stdout_entries.items[0].label);
+    try std.testing.expect(std.mem.containsAtLeast(u8, run_ctx.stdout_entries.items[0].content, 1, "\"Stub Manifest OK\""));
+    try std.testing.expectEqualStrings("Check A", run_ctx.stdout_entries.items[1].label);
+    try std.testing.expectEqualStrings("Check B", run_ctx.stdout_entries.items[2].label);
 }
 
 test "executeManifest runs serial and parallel tasks (real codex)" {
     const allocator = std.testing.allocator;
+
     const real_env = std.process.getEnvVarOwned(allocator, "PRAGMA_TEST_REAL_CODEX") catch null;
     defer if (real_env) |value| allocator.free(value);
     if (real_env == null) return;
+
+    const allow_real_env = std.process.getEnvVarOwned(allocator, "PRAGMA_ALLOW_REAL_CODEX_TESTS") catch null;
+    defer if (allow_real_env) |value| allocator.free(value);
+
+    const allow_real = blk: {
+        if (allow_real_env) |value| {
+            const trimmed = std.mem.trim(u8, value, " \t\r\n");
+            if (trimmed.len == 0) break :blk false;
+            if (std.ascii.eqlIgnoreCase(trimmed, "1") or std.ascii.eqlIgnoreCase(trimmed, "true") or std.ascii.eqlIgnoreCase(trimmed, "yes")) break :blk true;
+            break :blk false;
+        }
+        break :blk false;
+    };
+
+    if (!allow_real) return;
+
+    const codex_env = std.process.getEnvVarOwned(allocator, "PRAGMA_CODEX_BIN") catch null;
+    defer if (codex_env) |value| allocator.free(value);
+    if (codex_env == null or codex_env.?.len == 0) return;
+
+    const saved_override = codex.test_support.codex_override;
+    defer codex.test_support.codex_override = saved_override;
+    codex.test_support.codex_override = null;
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -573,7 +792,10 @@ test "executeManifest runs serial and parallel tasks (real codex)" {
         .runCodex = runCodex,
         .executeParallel = executeParallelTasks,
     };
-    try manifest.executeManifest(
+    const stdout_writer = manifest.nullOutputWriter();
+    const stderr_writer = manifest.nullOutputWriter();
+
+    try manifest.executeManifestWithWriters(
         RunContext,
         allocator,
         manifest_path,
@@ -581,6 +803,8 @@ test "executeManifest runs serial and parallel tasks (real codex)" {
         null,
         &run_ctx,
         deps,
+        stdout_writer,
+        stderr_writer,
     );
 }
 

@@ -31,6 +31,46 @@ pub const ManifestTaskView = struct {
     prompt: ?[]const u8,
 };
 
+pub const OutputWriter = struct {
+    ctx: *anyopaque,
+    writeFn: *const fn (*anyopaque, []const u8) anyerror!void,
+
+    pub fn writeAll(self: OutputWriter, data: []const u8) !void {
+        return self.writeFn(self.ctx, data);
+    }
+};
+
+const NullSink = struct {
+    pub fn writeAll(self: *@This(), _: []const u8) !void {
+        _ = self;
+    }
+};
+
+var null_sink = NullSink{};
+
+pub fn makeOutputWriter(writer_ptr: anytype) OutputWriter {
+    const ptr_info = @typeInfo(@TypeOf(writer_ptr));
+    comptime {
+        if (ptr_info != .pointer) @compileError("makeOutputWriter expects a pointer to a writer");
+    }
+    const WriterType = ptr_info.pointer.child;
+    const Adapter = struct {
+        fn write(ctx: *anyopaque, data: []const u8) anyerror!void {
+            const typed_ptr: *WriterType = @ptrCast(ctx);
+            try typed_ptr.*.writeAll(data);
+        }
+    };
+
+    return OutputWriter{
+        .ctx = @ptrCast(writer_ptr),
+        .writeFn = Adapter.write,
+    };
+}
+
+pub fn nullOutputWriter() OutputWriter {
+    return makeOutputWriter(&null_sink);
+}
+
 const ManifestTaskCollection = struct {
     tasks: ManagedArrayList(ManifestTaskView),
     names_to_free: ManagedArrayList([]u8),
@@ -56,6 +96,8 @@ pub fn Dependencies(comptime RunCtxType: type) type {
             ?[]const u8,
             ?[]const u8,
             *ManagedArrayList(ManifestTaskView),
+            OutputWriter,
+            OutputWriter,
         ) anyerror!void,
     };
 }
@@ -69,6 +111,37 @@ pub fn executeManifest(
     run_ctx: *RunCtxType,
     deps: Dependencies(RunCtxType),
 ) !void {
+    var stdout_file = std.fs.File.stdout();
+    var stdout_writer_impl = stdout_file.writer();
+    const stdout_writer = makeOutputWriter(&stdout_writer_impl);
+
+    var stderr_file = std.fs.File.stderr();
+    var stderr_writer_impl = stderr_file.writer();
+    const stderr_writer = makeOutputWriter(&stderr_writer_impl);
+    try executeManifestWithWriters(
+        RunCtxType,
+        allocator,
+        manifest_path,
+        cli_dir,
+        env_dir,
+        run_ctx,
+        deps,
+        stdout_writer,
+        stderr_writer,
+    );
+}
+
+pub fn executeManifestWithWriters(
+    comptime RunCtxType: type,
+    allocator: Allocator,
+    manifest_path: []const u8,
+    cli_dir: ?[]const u8,
+    env_dir: ?[]const u8,
+    run_ctx: *RunCtxType,
+    deps: Dependencies(RunCtxType),
+    stdout_writer: OutputWriter,
+    stderr_writer: OutputWriter,
+) !void {
     const max_size: usize = 4 * 1024 * 1024;
     const manifest_bytes = try std.fs.cwd().readFileAlloc(manifest_path, allocator, std.Io.Limit.limited(max_size));
     defer allocator.free(manifest_bytes);
@@ -77,18 +150,15 @@ pub fn executeManifest(
     defer deinitManifestDocument(allocator, doc);
 
     if (doc.steps.len == 0) {
-        try std.fs.File.stderr().writeAll("pragma: manifest must define at least one step\n");
+        try stderr_writer.writeAll("pragma: manifest must define at least one step\n");
         return error.InvalidDirective;
     }
-
-    const stdout_file = std.fs.File.stdout();
-    const stderr_file = std.fs.File.stderr();
 
     for (doc.steps, 0..) |*step, step_index| {
         const label = step.name orelse step.directive orelse doc.directive orelse "step";
         const header = try std.fmt.allocPrint(allocator, "=== Step {d}: {s}\n", .{ step_index + 1, label });
         defer allocator.free(header);
-        try stdout_file.writeAll(header);
+        try stdout_writer.writeAll(header);
 
         var tasks_list = try collectManifestTasks(allocator, &doc, step);
         defer {
@@ -98,7 +168,7 @@ pub fn executeManifest(
         }
 
         if (tasks_list.tasks.items.len == 0) {
-            try stderr_file.writeAll("pragma: manifest step produced no tasks\n");
+            try stderr_writer.writeAll("pragma: manifest step produced no tasks\n");
             return error.InvalidDirective;
         }
 
@@ -111,6 +181,8 @@ pub fn executeManifest(
                 cli_dir,
                 env_dir,
                 &tasks_list.tasks,
+                stdout_writer,
+                stderr_writer,
             );
         } else {
             for (tasks_list.tasks.items) |task_view| {
@@ -124,6 +196,8 @@ pub fn executeManifest(
                     env_dir,
                     task_view,
                     deps,
+                    stdout_writer,
+                    stderr_writer,
                 );
             }
         }
@@ -267,6 +341,8 @@ fn executeSerialTask(
     env_dir: ?[]const u8,
     task_view: ManifestTaskView,
     deps: Dependencies(RunCtxType),
+    stdout_writer: OutputWriter,
+    stderr_writer: OutputWriter,
 ) !void {
     var segments = [_]?[]const u8{ doc.core_prompt, step.prompt, task_view.prompt };
     const extra = try buildInlinePrompt(allocator, &segments);
@@ -284,7 +360,7 @@ fn executeSerialTask(
         const label = task_view.task_name orelse task_view.directive;
         const msg = try std.fmt.allocPrint(allocator, "pragma: step {s} failed to load directive ({s})\n", .{ label, @errorName(err) });
         defer allocator.free(msg);
-        try std.fs.File.stderr().writeAll(msg);
+        try stderr_writer.writeAll(msg);
         return err;
     };
     defer allocator.free(directive_doc.prompt);
@@ -301,16 +377,16 @@ fn executeSerialTask(
     const response = deps.runCodex(allocator, run_ctx, label, assembled) catch |err| {
         const msg = try std.fmt.allocPrint(allocator, "pragma: step {s} codex error ({s})\n", .{ label, @errorName(err) });
         defer allocator.free(msg);
-        try std.fs.File.stderr().writeAll(msg);
+        try stderr_writer.writeAll(msg);
         return err;
     };
     defer allocator.free(response);
 
     const header = try std.fmt.allocPrint(allocator, "--- Task: {s} (directive: {s})\n", .{ label, task_view.directive });
     defer allocator.free(header);
-    try std.fs.File.stdout().writeAll(header);
-    try std.fs.File.stdout().writeAll(response);
-    try std.fs.File.stdout().writeAll("\n");
+    try stdout_writer.writeAll(header);
+    try stdout_writer.writeAll(response);
+    try stdout_writer.writeAll("\n");
 }
 
 fn parseManifestStep(allocator: Allocator, item: std.json.Value) !ManifestStep {

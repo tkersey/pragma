@@ -1,4 +1,5 @@
 const std = @import("std");
+const manifest = @import("manifest.zig");
 
 const Allocator = std.mem.Allocator;
 const ManagedArrayList = std.array_list.Managed;
@@ -30,6 +31,8 @@ pub fn executeParallelTasks(
     cli_dir: ?[]const u8,
     env_dir: ?[]const u8,
     tasks: anytype,
+    stdout_writer: manifest.OutputWriter,
+    stderr_writer: manifest.OutputWriter,
 ) !void {
     const helpers_ptr = helpers;
     const HelpersType = @TypeOf(helpers_ptr.*);
@@ -94,7 +97,7 @@ pub fn executeParallelTasks(
             const label = ctx.label_task orelse ctx.directive;
             const msg = try std.fmt.allocPrint(allocator, "pragma: parallel task {s} failed ({s})\n", .{ label, @errorName(err) });
             defer allocator.free(msg);
-            try std.fs.File.stderr().writeAll(msg);
+            try stderr_writer.writeAll(msg);
             return err;
         }
     }
@@ -103,15 +106,15 @@ pub fn executeParallelTasks(
         const label = ctx.label_task orelse ctx.directive;
         const header = try std.fmt.allocPrint(allocator, "--- Parallel Task: {s} (directive: {s})\n", .{ label, ctx.directive });
         defer allocator.free(header);
-        try std.fs.File.stdout().writeAll(header);
+        try stdout_writer.writeAll(header);
         if (ctx.response) |resp| {
             defer {
                 ctx.allocator.free(resp);
                 ctx.response = null;
             }
-            try std.fs.File.stdout().writeAll(resp);
+            try stdout_writer.writeAll(resp);
         }
-        try std.fs.File.stdout().writeAll("\n");
+        try stdout_writer.writeAll("\n");
     }
 
     threads.deinit();
