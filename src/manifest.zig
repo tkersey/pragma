@@ -251,6 +251,17 @@ pub fn deinitManifestDocument(allocator: Allocator, doc: ManifestDocument) void 
     allocator.free(doc.steps);
 }
 
+/// Collect and normalize tasks from a manifest step for execution.
+///
+/// For parallel steps: Iterates through step.tasks, resolving directive/prompt
+/// inheritance from step and doc levels. Task names are allocated and tracked
+/// for later cleanup.
+///
+/// For serial steps: Creates a single task view from the step itself, using
+/// step.directive or falling back to doc.directive.
+///
+/// Returns a ManifestTaskCollection containing the executable task views,
+/// ownership information, and parallel/serial flag.
 pub fn collectManifestTasks(
     allocator: Allocator,
     doc: *const ManifestDocument,
@@ -278,6 +289,7 @@ pub fn collectManifestTasks(
                 const owned = try allocator.dupe(u8, value);
                 errdefer allocator.free(owned);
                 try names.append(owned);
+                errdefer _ = names.pop();
                 break :blk owned;
             } else name;
 
