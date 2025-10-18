@@ -105,7 +105,7 @@ Each step or task may override the `directive` and supply additional prompt text
 
 ### Run Artifacts
 
- Pragma watches the raw Codex streams and automatically offloads large payloads to disk:
+Pragma watches the raw Codex streams and automatically offloads large payloads to disk:
 
 - stdout above 64 KiB or stderr above 16 KiB is saved under `~/.pragma/runs/<timestamp>/`, and the CLI prints a notice pointing to the exact file.
 - The in-terminal view stays concise: stderr previews are capped at 4 KiB, and stdout continues to show only the final agent message.
