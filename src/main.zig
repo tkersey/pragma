@@ -294,12 +294,23 @@ pub fn main() !void {
 
     _ = args.next();
 
-    var invocation = parseCliInvocation(allocator, &args) catch |err| switch (err) {
+    var unknown_flag: ?[]u8 = null;
+    defer if (unknown_flag) |value| allocator.free(value);
+
+    var invocation = parseCliInvocation(allocator, &args, &unknown_flag) catch |err| switch (err) {
         error.MissingDirectiveValue, error.MissingDirectivesDirValue, error.MissingDirectiveName, error.ShowUsage => {
             try printUsage();
             return;
         },
         error.MissingManifestValue => {
+            try printUsage();
+            return;
+        },
+        error.UnknownFlag => {
+            const flag = unknown_flag orelse "";
+            const message = try std.fmt.allocPrint(allocator, "pragma: unknown flag {s}\n", .{flag});
+            defer allocator.free(message);
+            try std.fs.File.stderr().writeAll(message);
             try printUsage();
             return;
         },
@@ -445,7 +456,16 @@ fn parseStringFlag(
     return false;
 }
 
-fn parseCliInvocation(allocator: Allocator, args: *std.process.ArgIterator) !CliInvocation {
+fn parseCliInvocation(
+    allocator: Allocator,
+    args: *std.process.ArgIterator,
+    unknown_flag_out: *?[]u8,
+) !CliInvocation {
+    if (unknown_flag_out.*) |existing| {
+        allocator.free(existing);
+        unknown_flag_out.* = null;
+    }
+
     var directive: ?[]u8 = null;
     var directives_dir: ?[]u8 = null;
     var prompt_buffer = ManagedArrayList(u8).init(allocator);
@@ -487,8 +507,11 @@ fn parseCliInvocation(allocator: Allocator, args: *std.process.ArgIterator) !Cli
             if (try parseStringFlag(allocator, raw_arg, "directive", args, &directive, error.MissingDirectiveValue)) continue;
             if (try parseStringFlag(allocator, raw_arg, "directives-dir", args, &directives_dir, error.MissingDirectivesDirValue)) continue;
 
-            // Unknown flag - treat as start of prompt
-            reading_prompt = true;
+            // Unknown flag - bubble up for caller to handle
+            const copy = try allocator.dupe(u8, raw_arg);
+            if (unknown_flag_out.*) |existing| allocator.free(existing);
+            unknown_flag_out.* = copy;
+            return error.UnknownFlag;
         }
 
         if (reading_prompt and raw_arg.len == 0) continue;

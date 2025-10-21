@@ -10,7 +10,7 @@
 ## Build
 
 ```bash
-# Requires Zig 0.16.0-dev.732+2f3234c76 (install via zigup: brew install zigup && zigup 0.16.0-dev.732+2f3234c76)
+# Requires Zig 0.16.0-dev.747+493ad58ff (install via zigup: brew install zigup && zigup 0.16.0-dev.747+493ad58ff)
 zig build
 ```
 
@@ -111,6 +111,8 @@ Pragma watches the raw Codex streams and automatically offloads large payloads t
 - The in-terminal view stays concise: stderr previews are capped at 4 KiB, and stdout continues to show only the final agent message.
 - Override the thresholds with `PRAGMA_SPILL_STDOUT` and `PRAGMA_SPILL_STDERR` (byte counts). Adjust history pruning with `PRAGMA_RUN_HISTORY` (defaults to the 20 most recent runs).
 - Use `--keep-run-artifacts` or `PRAGMA_KEEP_RUN=1` to retain logs even when nothing overflowed, e.g. for hand-off to another tool.
+- All numeric environment knobs must now be unsigned integers; invalid values trigger an immediate error instead of silently falling back to defaults.
+- Limit concurrent Codex processes by setting `PRAGMA_PARALLEL_LIMIT` (defaults to the detected CPU count, with a minimum of 4). Values less than 1 are rejected.
 
 ## Install via Homebrew Tap
 

@@ -1,5 +1,6 @@
 const std = @import("std");
 const manifest = @import("manifest.zig");
+const codex = @import("codex.zig");
 
 const Allocator = std.mem.Allocator;
 const ManagedArrayList = std.array_list.Managed;
@@ -55,6 +56,51 @@ fn cleanupParallelProcess(allocator: Allocator, proc: *ParallelProcess) void {
     }
 }
 
+fn defaultParallelLimit() usize {
+    const cpu_result = std.Thread.getCpuCount() catch return 4;
+    return clampParallelLimit(cpu_result);
+}
+
+fn reportParallelLimitError(allocator: Allocator, value: []const u8) !void {
+    const msg = try std.fmt.allocPrint(
+        allocator,
+        "pragma: invalid value for PRAGMA_PARALLEL_LIMIT: \"{s}\" (expected integer >= 1)\n",
+        .{value},
+    );
+    defer allocator.free(msg);
+    try std.fs.File.stderr().writeAll(msg);
+}
+
+fn resolveParallelLimit(allocator: Allocator) !usize {
+    const env = std.process.getEnvVarOwned(allocator, "PRAGMA_PARALLEL_LIMIT") catch return defaultParallelLimit();
+    defer allocator.free(env);
+
+    const trimmed = std.mem.trim(u8, env, " \t\r\n");
+    if (trimmed.len == 0) {
+        try reportParallelLimitError(allocator, env);
+        return error.InvalidEnvValue;
+    }
+
+    const parsed = codex.parseBufferLimit(trimmed) catch |err| switch (err) {
+        error.InvalidNumber => {
+            try reportParallelLimitError(allocator, trimmed);
+            return error.InvalidEnvValue;
+        },
+        else => return err,
+    };
+
+    if (parsed == 0) {
+        try reportParallelLimitError(allocator, trimmed);
+        return error.InvalidEnvValue;
+    }
+
+    return parsed;
+}
+
+fn clampParallelLimit(raw: usize) usize {
+    return std.math.max(usize, raw, @as(usize, 4));
+}
+
 pub fn executeParallelTasks(
     allocator: Allocator,
     helpers: anytype,
@@ -64,6 +110,50 @@ pub fn executeParallelTasks(
     cli_dir: ?[]const u8,
     env_dir: ?[]const u8,
     tasks: anytype,
+    stdout_writer: manifest.OutputWriter,
+    stderr_writer: manifest.OutputWriter,
+) !void {
+    const limit = try resolveParallelLimit(allocator);
+    const total = tasks.items.len;
+    if (total > 0 and limit < total) {
+        const message = try std.fmt.allocPrint(
+            allocator,
+            "pragma: parallel step will batch {d} task(s) with limit {d}\n",
+            .{ total, limit },
+        );
+        defer allocator.free(message);
+        try stderr_writer.writeAll(message);
+    }
+
+    var index: usize = 0;
+    while (index < tasks.items.len) {
+        const end = std.math.min(index + limit, tasks.items.len);
+        const batch = tasks.items[index..end];
+        try executeBatch(
+            allocator,
+            helpers,
+            run_ctx,
+            doc,
+            step,
+            cli_dir,
+            env_dir,
+            batch,
+            stdout_writer,
+            stderr_writer,
+        );
+        index = end;
+    }
+}
+
+fn executeBatch(
+    allocator: Allocator,
+    helpers: anytype,
+    run_ctx: anytype,
+    doc: anytype,
+    step: anytype,
+    cli_dir: ?[]const u8,
+    env_dir: ?[]const u8,
+    batch: []const manifest.ManifestTaskView,
     stdout_writer: manifest.OutputWriter,
     stderr_writer: manifest.OutputWriter,
 ) !void {
@@ -79,7 +169,7 @@ pub fn executeParallelTasks(
         processes.deinit();
     }
 
-    for (tasks.items) |task_view| {
+    for (batch) |task_view| {
         var segments = [_]?[]const u8{ doc.core_prompt, step.prompt, task_view.prompt };
         const extra = try helper.buildInlinePrompt(allocator, &segments);
         defer if (extra) |value| allocator.free(value);
@@ -247,4 +337,10 @@ pub fn executeParallelTasks(
     }
 
     processes.deinit();
+}
+
+test "clampParallelLimit enforces minimum of four" {
+    try std.testing.expectEqual(@as(usize, 4), clampParallelLimit(0));
+    try std.testing.expectEqual(@as(usize, 4), clampParallelLimit(2));
+    try std.testing.expectEqual(@as(usize, 7), clampParallelLimit(7));
 }

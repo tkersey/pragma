@@ -30,9 +30,9 @@ pub const RunContext = struct {
     suppress_notices: bool = false,
 
     pub fn init(allocator: Allocator, keep_artifacts: bool) !RunContext {
-        const stdout_limit = parseSizeEnv(allocator, "PRAGMA_SPILL_STDOUT", 64 * 1024);
-        const stderr_limit = parseSizeEnv(allocator, "PRAGMA_SPILL_STDERR", 16 * 1024);
-        const retain_limit = parseSizeEnv(allocator, "PRAGMA_RUN_HISTORY", 20);
+        const stdout_limit = try parseSizeEnv(allocator, "PRAGMA_SPILL_STDOUT", 64 * 1024);
+        const stderr_limit = try parseSizeEnv(allocator, "PRAGMA_SPILL_STDERR", 16 * 1024);
+        const retain_limit = try parseSizeEnv(allocator, "PRAGMA_RUN_HISTORY", 20);
         const root = try resolveArtifactsRoot(allocator);
         errdefer allocator.free(root);
         try ensureDirectoryExists(root);
@@ -176,8 +176,10 @@ pub const RunContext = struct {
     }
 };
 
-pub fn parseBufferLimit(value_str: []const u8, default: usize) usize {
-    return std.fmt.parseInt(usize, value_str, 10) catch default;
+pub fn parseBufferLimit(value_str: []const u8) !usize {
+    const trimmed = std.mem.trim(u8, value_str, " \t\r\n");
+    if (trimmed.len == 0) return error.InvalidNumber;
+    return std.fmt.parseInt(usize, trimmed, 10) catch error.InvalidNumber;
 }
 
 pub fn buildCodexCommand(allocator: Allocator, prompt: []const u8) !CodexCommand {
@@ -213,34 +215,42 @@ pub fn buildCodexCommand(allocator: Allocator, prompt: []const u8) !CodexCommand
     };
 }
 
+fn emitSpawnFailure(allocator: Allocator, exec_name: []const u8, err: anyerror) !void {
+    const message = try std.fmt.allocPrint(
+        allocator,
+        "pragma: failed to execute {s}: {s}\n",
+        .{ exec_name, @errorName(err) },
+    );
+    defer allocator.free(message);
+    try std.fs.File.stderr().writeAll(message);
+}
+
 pub fn runCodex(allocator: Allocator, run_ctx: *RunContext, label: []const u8, prompt: []const u8) ![]u8 {
     var cmd = try buildCodexCommand(allocator, prompt);
     defer if (cmd.env_value) |value| allocator.free(value);
     defer allocator.free(cmd.argv);
+
+    const exec_name = cmd.argv[0];
 
     var process = std.process.Child.init(cmd.argv, allocator);
     process.stdin_behavior = .Ignore;
     process.stdout_behavior = .Pipe;
     process.stderr_behavior = .Pipe;
 
-    try process.spawn();
-    errdefer _ = process.wait() catch {};
+    var spawn_succeeded = false;
+    errdefer if (spawn_succeeded) {
+        _ = process.wait() catch {};
+    };
 
-    const max_stdout = blk: {
-        const env = std.process.getEnvVarOwned(allocator, "PRAGMA_MAX_STDOUT") catch break :blk 100 * 1024 * 1024;
-        defer allocator.free(env);
-        break :blk parseBufferLimit(env, 100 * 1024 * 1024);
+    process.spawn() catch |err| {
+        try emitSpawnFailure(allocator, exec_name, err);
+        return error.CodexSpawnFailed;
     };
-    const max_stderr = blk: {
-        const env = std.process.getEnvVarOwned(allocator, "PRAGMA_MAX_STDERR") catch break :blk 10 * 1024 * 1024;
-        defer allocator.free(env);
-        break :blk parseBufferLimit(env, 10 * 1024 * 1024);
-    };
-    const timeout_ms = blk: {
-        const env = std.process.getEnvVarOwned(allocator, "PRAGMA_CODEX_TIMEOUT_MS") catch break :blk 120_000;
-        defer allocator.free(env);
-        break :blk parseBufferLimit(env, 120_000);
-    };
+    spawn_succeeded = true;
+
+    const max_stdout = try parseSizeEnv(allocator, "PRAGMA_MAX_STDOUT", 100 * 1024 * 1024);
+    const max_stderr = try parseSizeEnv(allocator, "PRAGMA_MAX_STDERR", 10 * 1024 * 1024);
+    const timeout_ms = try parseSizeEnv(allocator, "PRAGMA_CODEX_TIMEOUT_MS", 120_000);
     const timeout_ns: ?u64 = if (timeout_ms == 0) null else timeout_ms * std.time.ns_per_ms;
 
     const output = collectChildOutput(allocator, &process, max_stdout, max_stderr, timeout_ns) catch |err| switch (err) {
@@ -254,7 +264,13 @@ pub fn runCodex(allocator: Allocator, run_ctx: *RunContext, label: []const u8, p
     defer allocator.free(output.stdout);
     defer allocator.free(output.stderr);
 
-    const term = try process.wait();
+    const term = process.wait() catch |err| switch (err) {
+        error.FileNotFound, error.ProcessNotFound => {
+            try emitSpawnFailure(allocator, exec_name, err);
+            return error.CodexSpawnFailed;
+        },
+        else => return err,
+    };
     switch (term) {
         .Exited => |code| if (code != 0) return error.CodexFailed,
         else => return error.CodexFailed,
@@ -326,10 +342,34 @@ pub fn extractAgentMarkdown(allocator: Allocator, stream: []const u8) ![]u8 {
     return allocator.dupe(u8, fallback);
 }
 
-fn parseSizeEnv(allocator: Allocator, name: []const u8, default_value: usize) usize {
+fn reportInvalidEnv(allocator: Allocator, name: []const u8, value: []const u8) !void {
+    const message = try std.fmt.allocPrint(
+        allocator,
+        "pragma: invalid value for {s}: \"{s}\" (expected unsigned integer)\n",
+        .{ name, value },
+    );
+    defer allocator.free(message);
+    try std.fs.File.stderr().writeAll(message);
+}
+
+fn parseSizeEnv(allocator: Allocator, name: []const u8, default_value: usize) !usize {
     const env = std.process.getEnvVarOwned(allocator, name) catch return default_value;
     defer allocator.free(env);
-    return parseBufferLimit(env, default_value);
+
+    const trimmed = std.mem.trim(u8, env, " \t\r\n");
+    if (trimmed.len == 0) {
+        try reportInvalidEnv(allocator, name, env);
+        return error.InvalidEnvValue;
+    }
+
+    const parsed = parseBufferLimit(trimmed) catch |err| switch (err) {
+        error.InvalidNumber => {
+            try reportInvalidEnv(allocator, name, trimmed);
+            return error.InvalidEnvValue;
+        },
+        else => return err,
+    };
+    return parsed;
 }
 
 fn resolveArtifactsRoot(allocator: Allocator) ![]u8 {
@@ -636,38 +676,34 @@ test "extractAgentMarkdown: mixed valid and invalid JSON" {
 }
 
 test "parseBufferLimit: valid positive number" {
-    const result = parseBufferLimit("1024", 512);
+    const result = try parseBufferLimit("1024");
     try std.testing.expectEqual(@as(usize, 1024), result);
 }
 
 test "parseBufferLimit: large number" {
-    const result = parseBufferLimit("104857600", 1024);
+    const result = try parseBufferLimit("104857600");
     try std.testing.expectEqual(@as(usize, 104857600), result);
 }
 
 test "parseBufferLimit: zero is valid" {
-    const result = parseBufferLimit("0", 1024);
+    const result = try parseBufferLimit("0");
     try std.testing.expectEqual(@as(usize, 0), result);
 }
 
-test "parseBufferLimit: invalid string returns default" {
-    const result = parseBufferLimit("not-a-number", 512);
-    try std.testing.expectEqual(@as(usize, 512), result);
+test "parseBufferLimit rejects invalid string" {
+    try std.testing.expectError(error.InvalidNumber, parseBufferLimit("not-a-number"));
 }
 
-test "parseBufferLimit: empty string returns default" {
-    const result = parseBufferLimit("", 1024);
-    try std.testing.expectEqual(@as(usize, 1024), result);
+test "parseBufferLimit rejects empty string" {
+    try std.testing.expectError(error.InvalidNumber, parseBufferLimit(""));
 }
 
-test "parseBufferLimit: negative number returns default" {
-    const result = parseBufferLimit("-100", 1024);
-    try std.testing.expectEqual(@as(usize, 1024), result);
+test "parseBufferLimit rejects negative numbers" {
+    try std.testing.expectError(error.InvalidNumber, parseBufferLimit("-100"));
 }
 
-test "parseBufferLimit: mixed alphanumeric returns default" {
-    const result = parseBufferLimit("123abc", 2048);
-    try std.testing.expectEqual(@as(usize, 2048), result);
+test "parseBufferLimit rejects mixed alphanumeric values" {
+    try std.testing.expectError(error.InvalidNumber, parseBufferLimit("123abc"));
 }
 
 test "RunContext spills stdout to disk when over limit" {
@@ -775,4 +811,23 @@ test "runCodex honors PRAGMA_CODEX_BIN stub" {
     defer allocator.free(output);
 
     try std.testing.expectEqualStrings("Stub OK", output);
+}
+
+test "runCodex surfaces spawn failure" {
+    const allocator = std.testing.allocator;
+
+    test_support.codex_override = "/nonexistent/codex-binary";
+    defer test_support.codex_override = null;
+
+    var ctx = try RunContext.init(allocator, false);
+    defer {
+        ctx.force_keep = false;
+        ctx.deinit(allocator);
+    }
+    ctx.suppress_notices = true;
+
+    try std.testing.expectError(
+        error.CodexSpawnFailed,
+        runCodex(allocator, &ctx, "missing", "Analyze"),
+    );
 }

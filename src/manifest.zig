@@ -160,7 +160,19 @@ pub fn executeManifestWithWriters(
         defer allocator.free(header);
         try stdout_writer.writeAll(header);
 
-        var tasks_list = try collectManifestTasks(allocator, &doc, step);
+        var tasks_list = collectManifestTasks(allocator, &doc, step) catch |err| switch (err) {
+            error.SerialTasksNotAllowed => {
+                const msg = try std.fmt.allocPrint(
+                    allocator,
+                    "pragma: manifest step {s} defines tasks but is missing `parallel: true`\n",
+                    .{label},
+                );
+                defer allocator.free(msg);
+                try stderr_writer.writeAll(msg);
+                return err;
+            },
+            else => return err,
+        };
         defer {
             for (tasks_list.names_to_free.items) |name_copy| allocator.free(name_copy);
             tasks_list.names_to_free.deinit();
@@ -277,6 +289,10 @@ pub fn collectManifestTasks(
     }
 
     var parallel = step.parallel;
+
+    if (!step.parallel and step.tasks != null) {
+        return error.SerialTasksNotAllowed;
+    }
 
     if (step.parallel) {
         const task_list = step.tasks orelse return error.InvalidDirective;
@@ -487,4 +503,29 @@ fn deinitManifestTask(allocator: Allocator, task: ManifestTask) void {
     if (task.name) |value| allocator.free(value);
     if (task.directive) |value| allocator.free(value);
     if (task.prompt) |value| allocator.free(value);
+}
+
+test "collectManifestTasks errors when serial step defines tasks" {
+    const allocator = std.testing.allocator;
+    const manifest_json =
+        \\{
+        \\  "directive": "review",
+        \\  "steps": [
+        \\    {
+        \\      "name": "Serial Step",
+        \\      "tasks": [
+        \\        { "name": "Nested" }
+        \\      ]
+        \\    }
+        \\  ]
+        \\}
+    ;
+
+    var doc = try parseManifestDocument(allocator, manifest_json);
+    defer deinitManifestDocument(allocator, doc);
+
+    try std.testing.expectError(
+        error.SerialTasksNotAllowed,
+        collectManifestTasks(allocator, &doc, &doc.steps[0]),
+    );
 }
