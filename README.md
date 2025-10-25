@@ -114,24 +114,14 @@ Pragma watches the raw Codex streams and automatically offloads large payloads t
 - All numeric environment knobs must now be unsigned integers; invalid values trigger an immediate error instead of silently falling back to defaults.
 - Limit concurrent Codex processes by setting `PRAGMA_PARALLEL_LIMIT` (defaults to the detected CPU count, with a minimum of 4). Values less than 1 are rejected.
 
-## Install via Homebrew Tap
-
-This repository doubles as a Homebrew tap. To build `pragma` from the latest `main` branch using Homebrew:
+## Install
 
 ```bash
 brew tap tkersey/pragma https://github.com/tkersey/pragma
-brew install --HEAD tkersey/pragma/pragma
+brew install tkersey/pragma/pragma
 ```
 
-The formula fetches this repository, runs `zig build -Doptimize=ReleaseFast`, and installs the resulting binary. The `--HEAD` flag is currently required because we no longer ship notarized release archives; Homebrew builds from source instead.
-
-Need a reproducible build? After tapping, you can check out the tap to a specific commit and reinstall:
-
-```bash
-cd "$(brew --repo tkersey/pragma)"
-git checkout <commit>
-brew reinstall --HEAD tkersey/pragma/pragma
-```
+The tap ships notarized universal binaries and a matching `pragma-scorecard` helper, so no local Zig toolchain is required. Use `brew reinstall --HEAD tkersey/pragma/pragma` if you want to build the latest commit from source instead.
 
 ## Scorecard Generation
 
