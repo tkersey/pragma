@@ -24,9 +24,18 @@ class Pragma < Formula
     if build.head? || self.class::METADATA.dig("macos", "url").nil?
       system "zig", "build", "-Doptimize=ReleaseFast"
       bin.install "zig-out/bin/pragma"
+      pkgshare.install "README.md"
     else
-      bin.install "pragma-macos/pragma"
-      bin.install "pragma-macos/pragma-scorecard"
+      archive_dir = Dir["pragma-macos*"].find { |path| File.directory?(path) }
+      if archive_dir
+        chdir archive_dir do
+          bin.install "pragma", "pragma-scorecard"
+          pkgshare.install "README.md"
+        end
+      else
+        bin.install "pragma", "pragma-scorecard"
+        pkgshare.install "README.md"
+      end
     end
   end
 
