@@ -98,7 +98,7 @@ fn resolveParallelLimit(allocator: Allocator) !usize {
 }
 
 fn clampParallelLimit(raw: usize) usize {
-    return std.math.max(usize, raw, @as(usize, 4));
+    return @max(raw, @as(usize, 4));
 }
 
 pub fn executeParallelTasks(
@@ -127,7 +127,7 @@ pub fn executeParallelTasks(
 
     var index: usize = 0;
     while (index < tasks.items.len) {
-        const end = std.math.min(index + limit, tasks.items.len);
+        const end = @min(index + limit, tasks.items.len);
         const batch = tasks.items[index..end];
         try executeBatch(
             allocator,

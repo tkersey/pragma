@@ -25,7 +25,8 @@ class Pragma < Formula
       system "zig", "build", "-Doptimize=ReleaseFast"
       bin.install "zig-out/bin/pragma"
     else
-      bin.install "pragma"
+      bin.install "pragma-macos/pragma"
+      bin.install "pragma-macos/pragma-scorecard"
     end
   end
 

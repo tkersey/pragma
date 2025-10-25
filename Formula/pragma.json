@@ -1,7 +1,7 @@
 {
-  "version": null,
+  "version": "0.0.1",
   "macos": {
-    "url": null,
-    "sha256": null
+    "url": "https://github.com/tkersey/pragma/releases/download/v0.0.1/pragma-macos-v0.0.1.zip",
+    "sha256": "0988ca09516bea2ec46850be306ce2e2db3984d7d9321763a6f6f7bfac867151"
   }
 }

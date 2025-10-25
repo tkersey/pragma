@@ -1,0 +1,34 @@
+version: 2
+project_name: pragma
+
+before:
+  hooks:
+    - sh -c "${ZIG_PATH:-zig} build -Doptimize=ReleaseFast"
+
+builds:
+  - id: noop
+    skip: true
+
+archives:
+  - id: pragma-macos
+    builds:
+      - noop
+    formats:
+      - zip
+    name_template: "{{ .ProjectName }}-{{ .Tag }}"
+    wrap_in_directory: true
+    files:
+      - README.md
+      - zig-out/bin/pragma
+      - zig-out/bin/pragma-scorecard
+
+checksum:
+  name_template: "{{ .ProjectName }}-{{ .Tag }}.sha256"
+
+release:
+  # GitHub Actions workflow handles publishing when running on main
+  prerelease: auto
+
+changelog:
+  use: git
+  sort: asc

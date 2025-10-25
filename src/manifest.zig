@@ -56,8 +56,9 @@ pub fn makeOutputWriter(writer_ptr: anytype) OutputWriter {
     const WriterType = ptr_info.pointer.child;
     const Adapter = struct {
         fn write(ctx: *anyopaque, data: []const u8) anyerror!void {
-            const typed_ptr: *WriterType = @ptrCast(ctx);
-            try typed_ptr.*.writeAll(data);
+            const aligned_ctx: *align(@alignOf(WriterType)) anyopaque = @alignCast(ctx);
+            const typed_ptr: *WriterType = @ptrCast(aligned_ctx);
+            try typed_ptr.writeAll(data);
         }
     };
 
@@ -112,11 +113,13 @@ pub fn executeManifest(
     deps: Dependencies(RunCtxType),
 ) !void {
     var stdout_file = std.fs.File.stdout();
-    var stdout_writer_impl = stdout_file.writer();
+    var stdout_buffer: [8192]u8 = undefined;
+    var stdout_writer_impl = stdout_file.writer(&stdout_buffer);
     const stdout_writer = makeOutputWriter(&stdout_writer_impl);
 
     var stderr_file = std.fs.File.stderr();
-    var stderr_writer_impl = stderr_file.writer();
+    var stderr_buffer: [8192]u8 = undefined;
+    var stderr_writer_impl = stderr_file.writer(&stderr_buffer);
     const stderr_writer = makeOutputWriter(&stderr_writer_impl);
     try executeManifestWithWriters(
         RunCtxType,

@@ -6,3 +6,4 @@ zig-out/
 .beads/*
 !.beads/*.jsonl
 AGENTS.md
+fastlane_certs/
