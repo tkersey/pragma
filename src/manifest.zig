@@ -58,7 +58,14 @@ pub fn makeOutputWriter(writer_ptr: anytype) OutputWriter {
         fn write(ctx: *anyopaque, data: []const u8) anyerror!void {
             const aligned_ctx: *align(@alignOf(WriterType)) anyopaque = @alignCast(ctx);
             const typed_ptr: *WriterType = @ptrCast(aligned_ctx);
-            try typed_ptr.writeAll(data);
+            if (@hasDecl(WriterType, "writeAll")) {
+                try typed_ptr.*.writeAll(data);
+            } else if (@hasField(WriterType, "interface")) {
+                const iface_ptr = &typed_ptr.interface;
+                try iface_ptr.writeAll(data);
+            } else {
+                @compileError("Writer type must expose writeAll or an interface field");
+            }
         }
     };
 
