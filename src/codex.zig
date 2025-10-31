@@ -215,7 +215,8 @@ pub fn buildCodexCommand(allocator: Allocator, prompt: []const u8) !CodexCommand
     };
 }
 
-fn emitSpawnFailure(allocator: Allocator, exec_name: []const u8, err: anyerror) !void {
+fn emitSpawnFailure(run_ctx: *RunContext, allocator: Allocator, exec_name: []const u8, err: anyerror) !void {
+    if (run_ctx.suppress_notices) return;
     const message = try std.fmt.allocPrint(
         allocator,
         "pragma: failed to execute {s}: {s}\n",
@@ -243,7 +244,7 @@ pub fn runCodex(allocator: Allocator, run_ctx: *RunContext, label: []const u8, p
     };
 
     process.spawn() catch |err| {
-        try emitSpawnFailure(allocator, exec_name, err);
+        try emitSpawnFailure(run_ctx, allocator, exec_name, err);
         return error.CodexSpawnFailed;
     };
     spawn_succeeded = true;
@@ -266,7 +267,7 @@ pub fn runCodex(allocator: Allocator, run_ctx: *RunContext, label: []const u8, p
 
     const term = process.wait() catch |err| switch (err) {
         error.FileNotFound, error.ProcessNotFound => {
-            try emitSpawnFailure(allocator, exec_name, err);
+            try emitSpawnFailure(run_ctx, allocator, exec_name, err);
             return error.CodexSpawnFailed;
         },
         else => return err,
