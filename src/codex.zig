@@ -69,7 +69,7 @@ pub const RunContext = struct {
 
         var random_bytes: [4]u8 = undefined;
         std.crypto.random.bytes(&random_bytes);
-        const timestamp = std.time.timestamp();
+        const timestamp = monotonicTimestamp();
         const hex_bytes = std.fmt.bytesToHex(random_bytes, .lower);
         const dir_name = try std.fmt.allocPrint(allocator, "{d}-{s}", .{ timestamp, hex_bytes[0..] });
         defer allocator.free(dir_name);
@@ -117,6 +117,35 @@ pub const RunContext = struct {
         try file.writeAll(content);
         self.force_keep = true;
         return path;
+    }
+
+    fn monotonicTimestamp() u64 {
+        const instant = std.time.Instant.now() catch {
+            return randomU64();
+        };
+
+        const raw = instant.timestamp;
+        switch (@typeInfo(@TypeOf(raw))) {
+            .@"struct" => {
+                const ts = raw;
+                const sec = if (ts.sec < 0) @as(u128, 0) else @as(u128, @intCast(ts.sec));
+                const nsec = @as(u128, @intCast(ts.nsec));
+                const total = sec * std.time.ns_per_s + nsec;
+                return @as(u64, @truncate(total));
+            },
+            .int => {
+                return @as(u64, raw);
+            },
+            else => {},
+        }
+
+        return randomU64();
+    }
+
+    fn randomU64() u64 {
+        var buf: [8]u8 = undefined;
+        std.crypto.random.bytes(&buf);
+        return @as(u64, @bitCast(buf));
     }
 
     pub fn handleStdout(self: *RunContext, allocator: Allocator, label: []const u8, content: []const u8) !void {

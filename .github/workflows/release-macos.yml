@@ -27,7 +27,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install Zig 0.16.0-dev.747+493ad58ff
+      - name: Install Zig 0.16.0-dev.1246+4b593a6c2
         run: |
           set -euxo pipefail
           arch="$(uname -m)"
@@ -37,7 +37,7 @@ jobs:
             *) echo "Unsupported architecture: $arch" >&2; exit 1 ;;
           esac
 
-          url="https://ziglang.org/builds/zig-${zig_arch}-macos-0.16.0-dev.747+493ad58ff.tar.xz"
+          url="https://ziglang.org/builds/zig-${zig_arch}-macos-0.16.0-dev.1246+4b593a6c2.tar.xz"
           curl --fail --location --output "${RUNNER_TEMP}/zig.tar.xz" "$url"
           tar -C "${RUNNER_TEMP}" -xf "${RUNNER_TEMP}/zig.tar.xz"
           zig_dir="$(tar -tf "${RUNNER_TEMP}/zig.tar.xz" | head -n 1 | tr -d '/')"
