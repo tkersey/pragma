@@ -1,16 +1,20 @@
 # Homebrew Tap Guide
 
-This repository doubles as a Homebrew tap so macOS users can install `pragma` directly from source. The formula lives in `Formula/pragma.rb` and defaults to building the current `main` branch.
+This repository doubles as a Homebrew tap so macOS users can install `pragma` directly from source. The formula lives in `Formula/pragma.rb` and now defaults to installing the notarized archive described in `Formula/pragma.json`.
 
 ## Install from the tap
 
 ```bash
 brew tap tkersey/pragma https://github.com/tkersey/pragma
-brew install --HEAD tkersey/pragma/pragma
+brew install tkersey/pragma/pragma
 pragma --version  # optional sanity check
 ```
 
-The `--HEAD` flag is required because we no longer publish notarized release archives. Homebrew clones this repository, runs `zig build -Doptimize=ReleaseFast`, and installs the resulting binary.
+Homebrew downloads the signed archive under `Formula/pragma.json` (currently built from tag releases) and installs it directly. Use `--HEAD` if you want to compile from the latest commit instead:
+
+```bash
+brew reinstall --HEAD tkersey/pragma/pragma
+```
 
 ## Validate local changes
 
@@ -35,12 +39,12 @@ git checkout <commit-or-tag>
 brew reinstall --HEAD tkersey/pragma/pragma
 ```
 
-## Optional metadata for future releases
+## Release metadata
 
-If you decide to ship prebuilt artifacts again, populate `Formula/pragma.json` with the version, download URL, and SHA256 checksum. When those fields are set the formula will install the archive instead of compiling from source.
+`Formula/pragma.json` stores the version, download URL, and SHA256 checksum for the prebuilt archive. The `scripts/update_formula.sh` helper rewrites that file every time a new notarized binary is uploaded to GitHub Releases:
 
 ```bash
-scripts/update_formula.sh v0.3.0 https://example.com/pragma-macos.zip <sha256>
+scripts/update_formula.sh 0.3.0 https://github.com/tkersey/pragma/releases/download/v0.3.0/pragma-macos-v0.3.0.zip <sha256>
 ```
 
 ## Troubleshooting
