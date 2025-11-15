@@ -10,7 +10,7 @@
 ## Build
 
 ```bash
-# Requires Zig 0.16.0-dev.1246+4b593a6c2 (install via zigup: brew install zigup && zigup 0.16.0-dev.1246+4b593a6c2)
+# Requires Zig 0.16.0-dev.1326+2e6f7d36b (install via zigup: brew install zigup && zigup 0.16.0-dev.1326+2e6f7d36b)
 zig build
 ```
 
